@@ -1,7 +1,7 @@
+import os
 import asyncio
 import random
 import logging
-from datetime import datetime
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -11,6 +11,11 @@ from captcha import solve_captcha
 import db
 
 log = logging.getLogger("worker")
+
+# ===== СКОРОСТЬ ОТВЕТА НА КАПЧУ (из Variables) =====
+# Буфер перед ответом (сек) — как будто человек смотрит и вводит
+CAPTCHA_DELAY_MIN = float(os.environ.get("CAPTCHA_DELAY_MIN", 0.3))
+CAPTCHA_DELAY_MAX = float(os.environ.get("CAPTCHA_DELAY_MAX", 1.0))
 
 
 class Worker:
@@ -32,37 +37,55 @@ class Worker:
 
     async def start(self):
         try:
-            await self.client.start()
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                await self.log("ERROR", "🚫 Сессия не авторизована — пересоздай")
+                await db.update_status(self.id, "dead", "session not authorized")
+                await self.client.disconnect()
+                raise Exception("Session not authorized")
+
             me = await self.client.get_me()
-            await self.log("INFO", f"Запущен как @{me.username or me.id}")
+            await self.log("INFO", f"✅ Запущен как @{me.username or me.id}")
 
             self.client.add_event_handler(
                 self.on_message, events.NewMessage(from_users=self.target_bot)
             )
         except (AuthKeyUnregisteredError, SessionRevokedError):
             await self.log("ERROR", "🚫 Сессия отозвана — пересоздай")
-            await db.update_status(self.id, "dead")
+            await db.update_status(self.id, "dead", "session revoked")
             raise
 
     async def stop(self):
         self.stopped = True
-        await self.client.disconnect()
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
 
     async def on_message(self, event):
         msg = event.message
         try:
             if msg.photo:
-                await self.log("INFO", "📩 Капча получена")
-                await self.human_pause(2.5, 6.5)
+                # ⚡ СКАЧИВАЕМ СРАЗУ — без задержки
                 image_bytes = await msg.download_media(bytes)
+
+                # ⚡ OCR — узкое место, но ускорен в captcha.py
                 code = solve_captcha(image_bytes)
                 await self.log("INFO", f"🔍 Распознан код: {code!r}")
-                if len(code) < 4:
-                    await self.log("WARN", "Короткий код — пропуск")
+
+                if len(code) < 3:
+                    await self.log("WARN", "Слишком короткий код — пропуск")
                     return
-                await self.human_pause(1.5, 4.0)
+
+                # ⚡ МИНИМАЛЬНАЯ ПАУЗА — имитация «ввода руками»
+                delay = random.uniform(CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                # ⚡ ОТПРАВЛЯЕМ СРАЗУ
                 await event.reply(code)
                 await self.log("INFO", f"📤 Отправлен код: {code}")
+
             elif msg.text:
                 await self.log("INFO", f"💬 Бот: {msg.text[:120]}")
 
@@ -81,7 +104,7 @@ class Worker:
             await asyncio.sleep(e.seconds)
         except (AuthKeyUnregisteredError, SessionRevokedError):
             await self.log("ERROR", "🚫 Сессия отозвана")
-            await db.update_status(self.id, "dead")
+            await db.update_status(self.id, "dead", "session revoked")
             self.stopped = True
         except Exception as e:
             await self.log("ERROR", f"Ошибка отправки: {e}")
