@@ -2,7 +2,6 @@ import os
 import asyncpg
 
 DATABASE_URL = os.environ["DATABASE_URL"]
-
 pool = None
 
 
@@ -14,17 +13,21 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS accounts (
                 id SERIAL PRIMARY KEY,
                 phone TEXT,
-                session_str TEXT UNIQUE,
+                session_str TEXT UNIQUE NOT NULL,
                 username TEXT,
                 status TEXT DEFAULT 'active',
                 bonuses INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
+                owner_id BIGINT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                last_run_at TIMESTAMP,
+                last_error TEXT
             );
         """)
+        await conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS owner_id BIGINT;")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id SERIAL PRIMARY KEY,
-                account_id INTEGER,
+                account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
                 level TEXT,
                 message TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
@@ -32,15 +35,15 @@ async def init_db():
         """)
 
 
-async def add_account(phone: str, session_str: str, username: str) -> int:
+async def add_account(phone: str, session_str: str, username: str, owner_id: int | None = None) -> int:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """INSERT INTO accounts (phone, session_str, username, status)
-               VALUES ($1, $2, $3, 'active')
+            """INSERT INTO accounts (phone, session_str, username, status, owner_id)
+               VALUES ($1, $2, $3, 'active', $4)
                ON CONFLICT (session_str) DO UPDATE
-               SET phone=$1, username=$3, status='active'
+               SET phone=$1, username=$3, status='active', last_error=NULL, owner_id=$4
                RETURNING id""",
-            phone, session_str, username
+            phone, session_str, username, owner_id
         )
         return row["id"]
 
@@ -66,14 +69,20 @@ async def delete_account(acc_id: int) -> bool:
         return result == "DELETE 1"
 
 
-async def update_status(acc_id: int, status: str):
+async def update_status(acc_id: int, status: str, error: str | None = None):
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE accounts SET status=$1 WHERE id=$2", status, acc_id)
+        await conn.execute(
+            "UPDATE accounts SET status=$1, last_error=$2 WHERE id=$3",
+            status, error, acc_id
+        )
 
 
 async def increment_bonus(acc_id: int):
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE accounts SET bonuses = bonuses + 1 WHERE id=$1", acc_id)
+        await conn.execute(
+            "UPDATE accounts SET bonuses = bonuses + 1, last_run_at = NOW() WHERE id=$1",
+            acc_id
+        )
 
 
 async def add_log(account_id: int, level: str, message: str):
@@ -86,7 +95,5 @@ async def add_log(account_id: int, level: str, message: str):
 
 async def get_recent_logs(limit: int = 30) -> list:
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM logs ORDER BY id DESC LIMIT $1", limit
-        )
+        rows = await conn.fetch("SELECT * FROM logs ORDER BY id DESC LIMIT $1", limit)
         return [dict(r) for r in rows]
