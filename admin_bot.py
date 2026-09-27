@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 
@@ -11,7 +12,7 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
-from telethon import TelegramClient, functions, types
+from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
@@ -82,7 +83,6 @@ async def check_account_alive(session_str: str) -> bool:
 #              ПОЛУЧИТЬ КОД ИЗ 777000
 # =========================================================
 async def get_last_code_from_telegram(session_str: str) -> str | None:
-    """Достаёт последнее сообщение с кодом от Telegram (777000)."""
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=12)
@@ -90,11 +90,8 @@ async def get_last_code_from_telegram(session_str: str) -> str | None:
             await client.disconnect()
             return None
 
-        # Ищем последние 20 сообщений от 777000
-        async for msg in client.iter_messages(777000, limit=20):
+        async for msg in client.iter_messages(777000, limit=30):
             text = msg.text or ""
-            # Ищем 5-значный код (Telegram обычно шлёт 5 цифр)
-            import re
             codes = re.findall(r"\b(\d{4,6})\b", text)
             if codes:
                 await client.disconnect()
@@ -112,67 +109,77 @@ async def get_last_code_from_telegram(session_str: str) -> str | None:
 
 
 # =========================================================
-#              УДАЛИТЬ ВСЕ СЕССИИ КРОМЕ ТЕКУЩЕЙ
+#              УДАЛИТЬ ВСЕ СЕССИИ, КРОМЕ ТЕКУЩЕЙ
 # =========================================================
-async def kill_other_sessions(session_str: str) -> int:
-    """Удаляет все активные сессии, кроме текущей. Возвращает сколько удалено."""
+async def kill_other_sessions(session_str: str) -> dict:
+    """
+    Удаляет все активные сессии, кроме текущей.
+    Возвращает {"deleted": N, "kept": N, "error": str|None}.
+    """
+    result = {"deleted": 0, "kept": 0, "error": None}
+
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
-        await asyncio.wait_for(client.connect(), timeout=12)
+        await asyncio.wait_for(client.connect(), timeout=15)
+
         if not await client.is_user_authorized():
-            await client.disconnect()
-            return -1  # сессия мертва
+            result["error"] = "Сессия не авторизована"
+            return result
 
-        # Получаем список всех активных сессий
-        result = await client(functions.account.GetAuthorizationsRequest())
+        # Определяем "свою" сессию: собираем её fingerprint через self
+        # Telethon хранит auth_key — можно сравнить по api_id + device_model + date.
+        # Надёжный способ: сессия, через которую мы сейчас сидим,
+        # помечена в raw-ответе как current=True. Telethon даёт это через a.current.
+        
+        auths_raw = await client(functions.account.GetAuthorizationsRequest())
+        auths = auths_raw.authorizations
+
+        log.info(f"GetAuthorizations: всего {len(auths)} сессий")
+
+        # Ищем current session
+        # В raw API Telethon auth имеет поле .current (bool)
         current_hash = None
+        for a in auths:
+            is_current = getattr(a, "current", False)
+            log.info(f"  - hash={a.hash} device={a.device_model} app={a.app_name} current={is_current}")
+            if is_current:
+                current_hash = a.hash
+                break
 
-        # Наша текущая сессия — та, где current=True
-        # Telethon сам знает свою сессию, но нам нужно найти её hash
-        # Проходим по всем, оставляем ту, что "текущая" (обычно последняя добавленная)
-        # Проще: удаляем все, кроме последней по дате создания? Нет.
-        # Решение: Telethon не даёт напрямую "какая моя", но есть трюк — 
-        # мы можем не удалять ту, что соответствует текущему устройству.
-        # Обычно "current=True" помечено в raw API.
+        # Если не нашли current — оставляем самую свежую с нашим api_id
+        if current_hash is None:
+            log.warning("current=True не найдено, использую фолбэк: самая свежая с нашим api_id")
+            ours = [a for a in auths if a.api_id == API_ID]
+            if ours:
+                newest = max(ours, key=lambda a: a.date_created)
+                current_hash = newest.hash
 
-        # Реальный способ: у Telethon нет прямого API "current".
-        # НО: список приходит отсортированным, и текущая — та, что last активна
-        # ещё сложнее. Проще — удалить все, кроме той, у которой device_model совпадает с нашей.
-        
-        # Ещё проще: удалить все КРОМЕ последней добавленной (текущей).
-        # Но это опасно, если ты добавил другой аккаунт.
-        
-        # Безопасный вариант: удалить все, что не является "текущей".
-        # Telethon хранит `self.session` и может дать её hash через
-        # `client.session.auth_key` — но это не hash сессии.
+        # Удаляем все, кроме current
+        for a in auths:
+            if a.hash == current_hash:
+                result["kept"] += 1
+                log.info(f"  ✅ Оставляем: {a.device_model} ({a.app_name})")
+                continue
 
-        # Обходной путь — использовать низкоуровневый API:
-        # GetAuthorizations возвращает объект, где есть hash сессий.
-        # Мы должны сравнить fingerprint с нашим. Увы, fingerprint не всегда точный.
-        
-        # Практическое решение: удалить все сессии, кроме самой новой.
-        # Отсортируем по date_created, оставим только последнюю.
-
-        auths = sorted(result.authorizations, key=lambda a: a.date_created)
-        deleted = 0
-        for a in auths[:-1]:  # всё, кроме последней
             try:
                 await client(functions.account.ResetAuthorizationRequest(hash=a.hash))
-                deleted += 1
+                result["deleted"] += 1
+                log.info(f"  🗑 Удалил: {a.device_model} ({a.app_name})")
                 await asyncio.sleep(0.5)
             except Exception as e:
-                log.warning(f"Kill session error: {e}")
+                log.warning(f"  ❌ Ошибка удаления {a.hash}: {e}")
 
         await client.disconnect()
-        return deleted
 
     except Exception as e:
         log.warning(f"kill_sessions error: {e}")
+        result["error"] = str(e)
         try:
             await client.disconnect()
         except Exception:
             pass
-        return -1
+
+    return result
 
 
 # =========================================================
@@ -220,7 +227,7 @@ async def send_main_menu(target, edit: bool = False):
 
 
 # =========================================================
-#                  СТАРТ / ХЕЛП
+#                   СТАРТ / ХЕЛП
 # =========================================================
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
@@ -260,7 +267,7 @@ async def cb_main(cb: CallbackQuery, state: FSMContext):
 
 
 # =========================================================
-#                    СПИСОК АККАУНТОВ
+#                    СПИСОК
 # =========================================================
 async def build_accounts_text(check: bool = True) -> str:
     accounts = await db.get_accounts()
@@ -325,29 +332,50 @@ async def cmd_list(msg: Message):
 
 
 # =========================================================
+#              УТИЛИТА: ПАРСИНГ ID
+# =========================================================
+def parse_ids(raw: str) -> list[int]:
+    result = []
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-")
+                result.extend(range(int(a), int(b) + 1))
+            except Exception:
+                continue
+        else:
+            try:
+                result.append(int(part))
+            except Exception:
+                continue
+    return sorted(set(result))
+
+
+# =========================================================
 #                 ПОЛУЧИТЬ КОД (/code)
 # =========================================================
+async def show_code_menu(target):
+    accounts = await db.get_accounts()
+    if not accounts:
+        await target.answer("📭 Нет аккаунтов")
+        return False
+    lines = ["🔢 <b>Отправь ID аккаунта</b>, чтобы получить последний код с 777000:\n"]
+    for a in accounts[:30]:
+        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
+        lines.append(f"{emoji} ID {a['id']} — @{a['username']} ({a['phone']})")
+    await target.answer("\n".join(lines), reply_markup=cancel_kb(), parse_mode="HTML")
+    return True
+
+
 @dp.callback_query(F.data == "menu_code")
 async def cb_menu_code(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
-    accounts = await db.get_accounts()
-    if not accounts:
-        await cb.message.answer("📭 Нет аккаунтов")
-        await cb.answer()
-        return
-
-    lines = ["🔢 <b>Отправь ID аккаунта</b>, чтобы получить последний код с 777000\n"]
-    for a in accounts[:30]:
-        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
-        lines.append(f"{emoji} ID {a['id']} — @{a['username']} ({a['phone']})")
-
-    await cb.message.answer(
-        "\n".join(lines),
-        reply_markup=cancel_kb(),
-        parse_mode="HTML"
-    )
-    await state.set_state(CodeSelect.waiting_id)
+    ok = await show_code_menu(cb.message)
+    if ok:
+        await state.set_state(CodeSelect.waiting_id)
     await cb.answer()
 
 
@@ -366,24 +394,22 @@ async def step_code_id(msg: Message, state: FSMContext):
         await msg.answer(f"❌ Аккаунт {acc_id} не найден")
         return
 
-    m = await msg.answer(f"🔍 Ищу последний код для <b>ID {acc_id}</b>...", parse_mode="HTML")
+    m = await msg.answer(f"🔍 Ищу код для <b>ID {acc_id}</b>...", parse_mode="HTML")
     code = await get_last_code_from_telegram(acc["session_str"])
 
     if code:
         await m.edit_text(
             f"🔢 <b>Последний код для ID {acc_id}</b>\n\n"
-            f"👤 @{acc['username']}\n"
-            f"📞 {acc['phone']}\n\n"
+            f"👤 @{acc['username']}\n📞 {acc['phone']}\n\n"
             f"<b>КОД: <code>{code}</code></b>",
             parse_mode="HTML"
         )
     else:
         await m.edit_text(
-            f"❌ Не нашёл код для <b>ID {acc_id}</b>\n\n"
-            f"Возможные причины:\n"
-            f"• Сессия мертва — проверь /list\n"
-            f"• Код старше 20 сообщений\n"
-            f"• Telegram не присылал код",
+            f"❌ Код не найден для <b>ID {acc_id}</b>\n\n"
+            f"• Проверь /list — живая ли сессия\n"
+            f"• Возможно, код не в 777000, а пришёл в SMS\n"
+            f"• Или старше 30 последних сообщений",
             parse_mode="HTML"
         )
     await state.clear()
@@ -396,8 +422,9 @@ async def cmd_code(msg: Message, state: FSMContext):
     parts = msg.text.split()
 
     if len(parts) == 1:
-        # Без аргумента — показать список и ждать ID
-        await cb_menu_code_menu(msg, state)
+        ok = await show_code_menu(msg)
+        if ok:
+            await state.set_state(CodeSelect.waiting_id)
         return
 
     raw = parts[1].strip()
@@ -411,7 +438,7 @@ async def cmd_code(msg: Message, state: FSMContext):
         await msg.answer(f"❌ Аккаунт {acc_id} не найден")
         return
 
-    m = await msg.answer(f"🔍 Ищу код для <b>ID {acc_id}</b>...", parse_mode="HTML")
+    m = await msg.answer(f"🔍 Ищу код для ID {acc_id}...")
     code = await get_last_code_from_telegram(acc["session_str"])
     if code:
         await m.edit_text(
@@ -423,43 +450,29 @@ async def cmd_code(msg: Message, state: FSMContext):
         await m.edit_text(f"❌ Код не найден для ID {acc_id}")
 
 
-async def cb_menu_code_menu(msg: Message, state: FSMContext):
-    accounts = await db.get_accounts()
-    if not accounts:
-        await msg.answer("📭 Нет аккаунтов")
-        return
-    lines = ["🔢 <b>Отправь ID аккаунта</b>:\n"]
-    for a in accounts[:30]:
-        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
-        lines.append(f"{emoji} ID {a['id']} — @{a['username']} ({a['phone']})")
-    await msg.answer("\n".join(lines), reply_markup=cancel_kb(), parse_mode="HTML")
-    await state.set_state(CodeSelect.waiting_id)
-
-
 # =========================================================
 #              УДАЛИТЬ СЕССИИ (/kill)
 # =========================================================
+async def show_kill_menu(target):
+    accounts = await db.get_accounts()
+    if not accounts:
+        await target.answer("📭 Нет аккаунтов")
+        return False
+    lines = ["🚪 <b>Отправь ID</b> — удалю ВСЕ сессии на аккаунте, кроме текущей\n"]
+    for a in accounts[:30]:
+        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
+        lines.append(f"{emoji} ID {a['id']} — @{a['username']}")
+    await target.answer("\n".join(lines), reply_markup=cancel_kb(), parse_mode="HTML")
+    return True
+
+
 @dp.callback_query(F.data == "menu_kill")
 async def cb_menu_kill(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
-    accounts = await db.get_accounts()
-    if not accounts:
-        await cb.message.answer("📭 Нет аккаунтов")
-        await cb.answer()
-        return
-
-    lines = ["🚪 <b>Отправь ID</b> — удалю все сессии на аккаунте, кроме текущей\n"]
-    for a in accounts[:30]:
-        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
-        lines.append(f"{emoji} ID {a['id']} — @{a['username']}")
-
-    await cb.message.answer(
-        "\n".join(lines),
-        reply_markup=cancel_kb(),
-        parse_mode="HTML"
-    )
-    await state.set_state(KillSessionSelect.waiting_id)
+    ok = await show_kill_menu(cb.message)
+    if ok:
+        await state.set_state(KillSessionSelect.waiting_id)
     await cb.answer()
 
 
@@ -479,19 +492,20 @@ async def step_kill_id(msg: Message, state: FSMContext):
         return
 
     m = await msg.answer(f"🚪 Удаляю сессии для <b>ID {acc_id}</b>...", parse_mode="HTML")
-    count = await kill_other_sessions(acc["session_str"])
+    res = await kill_other_sessions(acc["session_str"])
 
-    if count == -1:
+    if res["error"]:
         await m.edit_text(
-            f"❌ Сессия мертва или не авторизована\n"
-            f"Аккаунт ID {acc_id}",
+            f"❌ <b>Ошибка:</b> {res['error']}\n\n"
+            f"Аккаунт ID {acc_id} (@{acc['username']})",
             parse_mode="HTML"
         )
     else:
         await m.edit_text(
-            f"✅ <b>Удалено сессий:</b> {count}\n\n"
+            f"✅ <b>Готово</b>\n\n"
             f"👤 @{acc['username']} (ID {acc_id})\n"
-            f"Осталась только текущая сессия",
+            f"🗑 Удалено сессий: <b>{res['deleted']}</b>\n"
+            f"✅ Оставлено (текущая): <b>{res['kept']}</b>",
             parse_mode="HTML"
         )
     await state.clear()
@@ -502,8 +516,11 @@ async def cmd_kill(msg: Message, state: FSMContext):
     if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split()
+
     if len(parts) == 1:
-        await cb_menu_kill(MessageStub(msg), state)
+        ok = await show_kill_menu(msg)
+        if ok:
+            await state.set_state(KillSessionSelect.waiting_id)
         return
 
     raw = parts[1].strip()
@@ -518,24 +535,14 @@ async def cmd_kill(msg: Message, state: FSMContext):
         return
 
     m = await msg.answer(f"🚪 Удаляю сессии для ID {acc_id}...")
-    count = await kill_other_sessions(acc["session_str"])
-    if count == -1:
-        await m.edit_text(f"❌ Сессия мертва (ID {acc_id})")
+    res = await kill_other_sessions(acc["session_str"])
+    if res["error"]:
+        await m.edit_text(f"❌ {res['error']}")
     else:
-        await m.edit_text(f"✅ Удалено сессий: {count}")
-
-
-class MessageStub:
-    """Заглушка для вызова callback-функций из Command."""
-    def __init__(self, real_msg: Message):
-        self._msg = real_msg
-        self.from_user = real_msg.from_user
-
-    async def answer(self, text, **kw):
-        return await self._msg.answer(text, **kw)
-
-    async def edit_text(self, text, **kw):
-        return await self._msg.edit_text(text, **kw)
+        await m.edit_text(
+            f"✅ Удалено: <b>{res['deleted']}</b>, оставлено: <b>{res['kept']}</b>",
+            parse_mode="HTML"
+        )
 
 
 # =========================================================
@@ -545,7 +552,7 @@ class MessageStub:
 async def cb_bonus_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
-    await cb.answer("⏳ Запускаю...")
+    await cb.answer("⏳...")
     import main as app_main
     if not app_main.workers:
         await cb.message.answer("❌ Нет активных аккаунтов")
@@ -562,30 +569,11 @@ async def cb_bonus_select(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await cb.message.answer(
-        "🎯 Отправь <b>ID</b>:\n<code>1,3-5,8</code>",
+        "🎯 Отправь <b>ID</b>: <code>1,3-5,8</code>",
         reply_markup=cancel_kb(), parse_mode="HTML"
     )
     await state.set_state(BonusSelect.waiting_ids)
     await cb.answer()
-
-
-def parse_ids(raw: str) -> list[int]:
-    result = []
-    for part in raw.replace(" ", "").split(","):
-        if not part:
-            continue
-        if "-" in part:
-            try:
-                a, b = part.split("-")
-                result.extend(range(int(a), int(b) + 1))
-            except Exception:
-                continue
-        else:
-            try:
-                result.append(int(part))
-            except Exception:
-                continue
-    return sorted(set(result))
 
 
 @dp.message(BonusSelect.waiting_ids)
@@ -608,7 +596,7 @@ async def step_bonus_ids(msg: Message, state: FSMContext):
 
     text = f"🎁 Бонус: <b>{ok}</b>"
     if missing:
-        text += f"\n⚠️ Не найдено: {missing}"
+        text += f"\n⚠️ Не найдено/остановлено: {missing}"
     await msg.answer(text, reply_markup=back_kb(), parse_mode="HTML")
     await state.clear()
 
@@ -791,11 +779,8 @@ async def cb_stats(cb: CallbackQuery):
     running = len(app_main.workers)
     text = (
         f"📊 <b>Статистика</b>\n\n"
-        f"👥 Всего: {total}\n"
-        f"🟢 Живых: {active}\n"
-        f"🔴 Мёртвых: {dead}\n"
-        f"⚙️ Worker-ов: {running}\n"
-        f"🎁 Бонусов: {bonuses}"
+        f"👥 Всего: {total}\n🟢 Живых: {active}\n🔴 Мёртвых: {dead}\n"
+        f"⚙️ Worker-ов: {running}\n🎁 Бонусов: {bonuses}"
     )
     try:
         await cb.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
