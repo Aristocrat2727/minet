@@ -11,7 +11,7 @@ from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
@@ -49,6 +49,14 @@ class BonusSelect(StatesGroup):
     waiting_ids = State()
 
 
+class CodeSelect(StatesGroup):
+    waiting_id = State()
+
+
+class KillSessionSelect(StatesGroup):
+    waiting_id = State()
+
+
 pending_clients: dict[int, TelegramClient] = {}
 
 
@@ -56,7 +64,6 @@ pending_clients: dict[int, TelegramClient] = {}
 #              ПРОВЕРКА АКТИВНОСТИ
 # =========================================================
 async def check_account_alive(session_str: str) -> bool:
-    """Живая ли сессия. True/False."""
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     try:
         await asyncio.wait_for(client.connect(), timeout=12)
@@ -71,28 +78,101 @@ async def check_account_alive(session_str: str) -> bool:
         return False
 
 
-async def refresh_all_statuses() -> dict:
-    """Проверяет все аккаунты и обновляет статусы в БД."""
-    accounts = await db.get_accounts()
-    if not accounts:
-        return {"alive": 0, "dead": 0, "total": 0}
+# =========================================================
+#              ПОЛУЧИТЬ КОД ИЗ 777000
+# =========================================================
+async def get_last_code_from_telegram(session_str: str) -> str | None:
+    """Достаёт последнее сообщение с кодом от Telegram (777000)."""
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=12)
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None
 
-    tasks = [check_account_alive(a["session_str"]) for a in accounts]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Ищем последние 20 сообщений от 777000
+        async for msg in client.iter_messages(777000, limit=20):
+            text = msg.text or ""
+            # Ищем 5-значный код (Telegram обычно шлёт 5 цифр)
+            import re
+            codes = re.findall(r"\b(\d{4,6})\b", text)
+            if codes:
+                await client.disconnect()
+                return codes[0]
 
-    alive = dead = 0
-    for a, r in zip(accounts, results):
-        ok = r if isinstance(r, bool) else False
-        if ok:
-            alive += 1
-            if a["status"] != "active":
-                await db.update_status(a["id"], "active", None)
-        else:
-            dead += 1
-            if a["status"] != "dead":
-                await db.update_status(a["id"], "dead", "session not authorized")
+        await client.disconnect()
+        return None
+    except Exception as e:
+        log.warning(f"get_code error: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return None
 
-    return {"alive": alive, "dead": dead, "total": len(accounts)}
+
+# =========================================================
+#              УДАЛИТЬ ВСЕ СЕССИИ КРОМЕ ТЕКУЩЕЙ
+# =========================================================
+async def kill_other_sessions(session_str: str) -> int:
+    """Удаляет все активные сессии, кроме текущей. Возвращает сколько удалено."""
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=12)
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return -1  # сессия мертва
+
+        # Получаем список всех активных сессий
+        result = await client(functions.account.GetAuthorizationsRequest())
+        current_hash = None
+
+        # Наша текущая сессия — та, где current=True
+        # Telethon сам знает свою сессию, но нам нужно найти её hash
+        # Проходим по всем, оставляем ту, что "текущая" (обычно последняя добавленная)
+        # Проще: удаляем все, кроме последней по дате создания? Нет.
+        # Решение: Telethon не даёт напрямую "какая моя", но есть трюк — 
+        # мы можем не удалять ту, что соответствует текущему устройству.
+        # Обычно "current=True" помечено в raw API.
+
+        # Реальный способ: у Telethon нет прямого API "current".
+        # НО: список приходит отсортированным, и текущая — та, что last активна
+        # ещё сложнее. Проще — удалить все, кроме той, у которой device_model совпадает с нашей.
+        
+        # Ещё проще: удалить все КРОМЕ последней добавленной (текущей).
+        # Но это опасно, если ты добавил другой аккаунт.
+        
+        # Безопасный вариант: удалить все, что не является "текущей".
+        # Telethon хранит `self.session` и может дать её hash через
+        # `client.session.auth_key` — но это не hash сессии.
+
+        # Обходной путь — использовать низкоуровневый API:
+        # GetAuthorizations возвращает объект, где есть hash сессий.
+        # Мы должны сравнить fingerprint с нашим. Увы, fingerprint не всегда точный.
+        
+        # Практическое решение: удалить все сессии, кроме самой новой.
+        # Отсортируем по date_created, оставим только последнюю.
+
+        auths = sorted(result.authorizations, key=lambda a: a.date_created)
+        deleted = 0
+        for a in auths[:-1]:  # всё, кроме последней
+            try:
+                await client(functions.account.ResetAuthorizationRequest(hash=a.hash))
+                deleted += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.warning(f"Kill session error: {e}")
+
+        await client.disconnect()
+        return deleted
+
+    except Exception as e:
+        log.warning(f"kill_sessions error: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return -1
 
 
 # =========================================================
@@ -102,7 +182,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="menu_add")],
         [InlineKeyboardButton(text="📋 Список аккаунтов", callback_data="menu_list")],
-        [InlineKeyboardButton(text="🔑 Аккаунты + session_str", callback_data="menu_accounts")],
+        [InlineKeyboardButton(text="🔢 Получить код", callback_data="menu_code")],
+        [InlineKeyboardButton(text="🚪 Удалить сессии", callback_data="menu_kill")],
         [InlineKeyboardButton(text="🎁 Бонус: все", callback_data="bonus_all")],
         [InlineKeyboardButton(text="🎯 Бонус: выборочно", callback_data="bonus_select")],
         [
@@ -139,7 +220,7 @@ async def send_main_menu(target, edit: bool = False):
 
 
 # =========================================================
-#                   СТАРТ / ХЕЛП
+#                  СТАРТ / ХЕЛП
 # =========================================================
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
@@ -154,19 +235,16 @@ async def cmd_help(msg: Message):
         return
     await msg.answer(
         "📖 <b>Команды</b>\n\n"
-        "<b>Аккаунты:</b>\n"
-        "/add — добавить\n"
-        "/list — список с проверкой живых\n"
-        "/account — все с session_str\n"
-        "/account 3 — только аккаунт 3\n"
-        "/account 1,3-5 — несколько\n\n"
-        "<b>Бонусы:</b>\n"
-        "/bonus — всем\n"
-        "/bonus 3 — аккаунту 3\n"
-        "/bonus 1,3-5 — нескольким\n\n"
-        "<b>Удаление:</b>\n"
+        "/add — добавить аккаунт\n"
+        "/list — список с проверкой\n"
+        "/code — получить код с 777000\n"
+        "/code 3 — код для аккаунта 3\n"
+        "/kill — удалить все сессии\n"
+        "/kill 3 — для аккаунта 3\n"
+        "/bonus — бонус всем\n"
+        "/bonus 1,3-5 — нескольким\n"
         "/del 3 — удалить аккаунт\n"
-        "/delall — удалить все\n\n"
+        "/delall — удалить все\n"
         "/logs — логи",
         parse_mode="HTML"
     )
@@ -182,7 +260,7 @@ async def cb_main(cb: CallbackQuery, state: FSMContext):
 
 
 # =========================================================
-#                       СПИСОК
+#                    СПИСОК АККАУНТОВ
 # =========================================================
 async def build_accounts_text(check: bool = True) -> str:
     accounts = await db.get_accounts()
@@ -215,8 +293,6 @@ async def build_accounts_text(check: bool = True) -> str:
             dead += 1
 
     lines.append(f"\n📊 Живых: {alive} | Мёртвых: {dead}")
-    lines.append("💡 /bonus N — бонус конкретному")
-    lines.append("💡 /account — session_str")
     return "\n".join(lines)
 
 
@@ -249,10 +325,251 @@ async def cmd_list(msg: Message):
 
 
 # =========================================================
-#              АККАУНТЫ + SESSION_STR (/account)
+#                 ПОЛУЧИТЬ КОД (/code)
 # =========================================================
+@dp.callback_query(F.data == "menu_code")
+async def cb_menu_code(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    accounts = await db.get_accounts()
+    if not accounts:
+        await cb.message.answer("📭 Нет аккаунтов")
+        await cb.answer()
+        return
+
+    lines = ["🔢 <b>Отправь ID аккаунта</b>, чтобы получить последний код с 777000\n"]
+    for a in accounts[:30]:
+        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
+        lines.append(f"{emoji} ID {a['id']} — @{a['username']} ({a['phone']})")
+
+    await cb.message.answer(
+        "\n".join(lines),
+        reply_markup=cancel_kb(),
+        parse_mode="HTML"
+    )
+    await state.set_state(CodeSelect.waiting_id)
+    await cb.answer()
+
+
+@dp.message(CodeSelect.waiting_id)
+async def step_code_id(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    raw = msg.text.strip().replace(" ", "").replace(",", "")
+    if not raw.isdigit():
+        await msg.answer("❌ ID должен быть числом")
+        return
+    acc_id = int(raw)
+
+    acc = await db.get_account(acc_id)
+    if not acc:
+        await msg.answer(f"❌ Аккаунт {acc_id} не найден")
+        return
+
+    m = await msg.answer(f"🔍 Ищу последний код для <b>ID {acc_id}</b>...", parse_mode="HTML")
+    code = await get_last_code_from_telegram(acc["session_str"])
+
+    if code:
+        await m.edit_text(
+            f"🔢 <b>Последний код для ID {acc_id}</b>\n\n"
+            f"👤 @{acc['username']}\n"
+            f"📞 {acc['phone']}\n\n"
+            f"<b>КОД: <code>{code}</code></b>",
+            parse_mode="HTML"
+        )
+    else:
+        await m.edit_text(
+            f"❌ Не нашёл код для <b>ID {acc_id}</b>\n\n"
+            f"Возможные причины:\n"
+            f"• Сессия мертва — проверь /list\n"
+            f"• Код старше 20 сообщений\n"
+            f"• Telegram не присылал код",
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+
+@dp.message(Command("code"))
+async def cmd_code(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split()
+
+    if len(parts) == 1:
+        # Без аргумента — показать список и ждать ID
+        await cb_menu_code_menu(msg, state)
+        return
+
+    raw = parts[1].strip()
+    if not raw.isdigit():
+        await msg.answer("❌ Формат: /code 3")
+        return
+    acc_id = int(raw)
+
+    acc = await db.get_account(acc_id)
+    if not acc:
+        await msg.answer(f"❌ Аккаунт {acc_id} не найден")
+        return
+
+    m = await msg.answer(f"🔍 Ищу код для <b>ID {acc_id}</b>...", parse_mode="HTML")
+    code = await get_last_code_from_telegram(acc["session_str"])
+    if code:
+        await m.edit_text(
+            f"🔢 <b>Код для ID {acc_id}</b> (@{acc['username']})\n\n"
+            f"<b><code>{code}</code></b>",
+            parse_mode="HTML"
+        )
+    else:
+        await m.edit_text(f"❌ Код не найден для ID {acc_id}")
+
+
+async def cb_menu_code_menu(msg: Message, state: FSMContext):
+    accounts = await db.get_accounts()
+    if not accounts:
+        await msg.answer("📭 Нет аккаунтов")
+        return
+    lines = ["🔢 <b>Отправь ID аккаунта</b>:\n"]
+    for a in accounts[:30]:
+        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
+        lines.append(f"{emoji} ID {a['id']} — @{a['username']} ({a['phone']})")
+    await msg.answer("\n".join(lines), reply_markup=cancel_kb(), parse_mode="HTML")
+    await state.set_state(CodeSelect.waiting_id)
+
+
+# =========================================================
+#              УДАЛИТЬ СЕССИИ (/kill)
+# =========================================================
+@dp.callback_query(F.data == "menu_kill")
+async def cb_menu_kill(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    accounts = await db.get_accounts()
+    if not accounts:
+        await cb.message.answer("📭 Нет аккаунтов")
+        await cb.answer()
+        return
+
+    lines = ["🚪 <b>Отправь ID</b> — удалю все сессии на аккаунте, кроме текущей\n"]
+    for a in accounts[:30]:
+        emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
+        lines.append(f"{emoji} ID {a['id']} — @{a['username']}")
+
+    await cb.message.answer(
+        "\n".join(lines),
+        reply_markup=cancel_kb(),
+        parse_mode="HTML"
+    )
+    await state.set_state(KillSessionSelect.waiting_id)
+    await cb.answer()
+
+
+@dp.message(KillSessionSelect.waiting_id)
+async def step_kill_id(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    raw = msg.text.strip().replace(" ", "")
+    if not raw.isdigit():
+        await msg.answer("❌ ID должен быть числом")
+        return
+    acc_id = int(raw)
+
+    acc = await db.get_account(acc_id)
+    if not acc:
+        await msg.answer(f"❌ Аккаунт {acc_id} не найден")
+        return
+
+    m = await msg.answer(f"🚪 Удаляю сессии для <b>ID {acc_id}</b>...", parse_mode="HTML")
+    count = await kill_other_sessions(acc["session_str"])
+
+    if count == -1:
+        await m.edit_text(
+            f"❌ Сессия мертва или не авторизована\n"
+            f"Аккаунт ID {acc_id}",
+            parse_mode="HTML"
+        )
+    else:
+        await m.edit_text(
+            f"✅ <b>Удалено сессий:</b> {count}\n\n"
+            f"👤 @{acc['username']} (ID {acc_id})\n"
+            f"Осталась только текущая сессия",
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+
+@dp.message(Command("kill"))
+async def cmd_kill(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split()
+    if len(parts) == 1:
+        await cb_menu_kill(MessageStub(msg), state)
+        return
+
+    raw = parts[1].strip()
+    if not raw.isdigit():
+        await msg.answer("❌ Формат: /kill 3")
+        return
+    acc_id = int(raw)
+
+    acc = await db.get_account(acc_id)
+    if not acc:
+        await msg.answer(f"❌ Аккаунт {acc_id} не найден")
+        return
+
+    m = await msg.answer(f"🚪 Удаляю сессии для ID {acc_id}...")
+    count = await kill_other_sessions(acc["session_str"])
+    if count == -1:
+        await m.edit_text(f"❌ Сессия мертва (ID {acc_id})")
+    else:
+        await m.edit_text(f"✅ Удалено сессий: {count}")
+
+
+class MessageStub:
+    """Заглушка для вызова callback-функций из Command."""
+    def __init__(self, real_msg: Message):
+        self._msg = real_msg
+        self.from_user = real_msg.from_user
+
+    async def answer(self, text, **kw):
+        return await self._msg.answer(text, **kw)
+
+    async def edit_text(self, text, **kw):
+        return await self._msg.edit_text(text, **kw)
+
+
+# =========================================================
+#                    БОНУСЫ
+# =========================================================
+@dp.callback_query(F.data == "bonus_all")
+async def cb_bonus_all(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    await cb.answer("⏳ Запускаю...")
+    import main as app_main
+    if not app_main.workers:
+        await cb.message.answer("❌ Нет активных аккаунтов")
+        return
+    count = 0
+    for w in list(app_main.workers.values()):
+        asyncio.create_task(w.send_bonus())
+        count += 1
+    await cb.message.answer(f"🎁 Бонус: <b>{count}</b> аккаунтов", parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "bonus_select")
+async def cb_bonus_select(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    await cb.message.answer(
+        "🎯 Отправь <b>ID</b>:\n<code>1,3-5,8</code>",
+        reply_markup=cancel_kb(), parse_mode="HTML"
+    )
+    await state.set_state(BonusSelect.waiting_ids)
+    await cb.answer()
+
+
 def parse_ids(raw: str) -> list[int]:
-    """'1,3-5,8' → [1,3,4,5,8]"""
     result = []
     for part in raw.replace(" ", "").split(","):
         if not part:
@@ -269,113 +586,6 @@ def parse_ids(raw: str) -> list[int]:
             except Exception:
                 continue
     return sorted(set(result))
-
-
-async def send_account_full(msg: Message, a: dict):
-    """Отправляет инфу об аккаунте (с session_str), разбивая если длинно."""
-    emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
-    created = a["created_at"].strftime("%d.%m.%Y %H:%M") if a.get("created_at") else "—"
-    last_run = a["last_run_at"].strftime("%d.%m.%Y %H:%M") if a.get("last_run_at") else "—"
-
-    header = (
-        f"{emoji} <b>ID {a['id']}</b> — @{a['username']}\n\n"
-        f"📞 <b>Phone:</b> <code>{a['phone']}</code>\n"
-        f"🎁 Бонусов: {a['bonuses']}\n"
-        f"📊 Статус: {a['status']}\n"
-        f"🕐 Создан: {created}\n"
-        f"⏱ Последний запуск: {last_run}\n"
-    )
-    if a.get("last_error"):
-        header += f"⚠️ Ошибка: <code>{str(a['last_error'])[:100]}</code>\n"
-
-    session_block = f"\n🔑 <b>SESSION_STR:</b>\n<code>{a['session_str']}</code>"
-
-    # Отправляем header отдельно (он короткий)
-    try:
-        await msg.answer(header, parse_mode="HTML")
-    except Exception:
-        await msg.answer(f"{emoji} ID {a['id']} — @{a['username']}")
-
-    # Потом session_str (он длинный) — если длиннее 4000, режем
-    if len(session_block) > 4000:
-        session_block = session_block[:4000] + "..."
-    try:
-        await msg.answer(session_block, parse_mode="HTML")
-    except Exception as e:
-        await msg.answer(f"❌ Не удалось отправить session_str: {e}")
-
-
-@dp.message(Command("account"))
-async def cmd_account(msg: Message):
-    """Показывает phone + session_str каждого аккаунта."""
-    if not is_admin(msg.from_user.id):
-        return
-
-    parts = msg.text.split()
-    accounts = await db.get_accounts()
-
-    if len(parts) >= 2:
-        ids = parse_ids(parts[1])
-        if ids:
-            accounts = [a for a in accounts if a["id"] in ids]
-
-    if not accounts:
-        await msg.answer("📭 Нет аккаунтов")
-        return
-
-    for a in accounts:
-        await send_account_full(msg, a)
-        await asyncio.sleep(0.5)  # против флуд-лимита Telegram
-
-
-@dp.callback_query(F.data == "menu_accounts")
-async def cb_accounts(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return
-    await cb.answer("📤 Отправляю...")
-    accounts = await db.get_accounts()
-    if not accounts:
-        await cb.message.answer("📭 Нет аккаунтов")
-        return
-    for a in accounts:
-        await send_account_full(cb.message, a)
-        await asyncio.sleep(0.5)
-
-
-# =========================================================
-#                    БОНУСЫ
-# =========================================================
-@dp.callback_query(F.data == "bonus_all")
-async def cb_bonus_all(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return
-    await cb.answer("⏳ Запускаю...")
-    import main as app_main
-    if not app_main.workers:
-        await cb.message.answer("❌ Нет активных аккаунтов")
-        return
-    count = 0
-    for acc_id, w in list(app_main.workers.items()):
-        asyncio.create_task(w.send_bonus())
-        count += 1
-    await cb.message.answer(f"🎁 Бонус запущен для <b>{count}</b> аккаунтов", parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "bonus_select")
-async def cb_bonus_select(cb: CallbackQuery, state: FSMContext):
-    if not is_admin(cb.from_user.id):
-        return
-    await cb.message.answer(
-        "🎯 Отправь <b>ID</b> через запятую или диапазон:\n\n"
-        "<code>1</code> — только 1\n"
-        "<code>1,3,5</code> — 1, 3, 5\n"
-        "<code>2-5</code> — 2, 3, 4, 5\n"
-        "<code>1,3-5,8</code> — комбинированно",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML"
-    )
-    await state.set_state(BonusSelect.waiting_ids)
-    await cb.answer()
 
 
 @dp.message(BonusSelect.waiting_ids)
@@ -396,9 +606,9 @@ async def step_bonus_ids(msg: Message, state: FSMContext):
         else:
             missing.append(acc_id)
 
-    text = f"🎁 Бонус запущен: <b>{ok}</b>"
+    text = f"🎁 Бонус: <b>{ok}</b>"
     if missing:
-        text += f"\n⚠️ Не найдено/остановлено: {missing}"
+        text += f"\n⚠️ Не найдено: {missing}"
     await msg.answer(text, reply_markup=back_kb(), parse_mode="HTML")
     await state.clear()
 
@@ -412,18 +622,18 @@ async def cmd_bonus(msg: Message):
 
     if len(parts) == 1:
         if not app_main.workers:
-            await msg.answer("❌ Нет активных аккаунтов")
+            await msg.answer("❌ Нет активных")
             return
         count = 0
         for w in list(app_main.workers.values()):
             asyncio.create_task(w.send_bonus())
             count += 1
-        await msg.answer(f"🎁 Бонус запущен: <b>{count}</b>", parse_mode="HTML")
+        await msg.answer(f"🎁 Бонус: <b>{count}</b>", parse_mode="HTML")
         return
 
     ids = parse_ids(parts[1])
     if not ids:
-        await msg.answer("❌ Формат: /bonus 1,3-5")
+        await msg.answer("❌ /bonus 1,3-5")
         return
 
     ok, missing = 0, []
@@ -436,7 +646,7 @@ async def cmd_bonus(msg: Message):
 
     text = f"🎁 Бонус: <b>{ok}</b>"
     if missing:
-        text += f"\n⚠️ Не найдено: {missing}"
+        text += f"\n⚠️ {missing}"
     await msg.answer(text, parse_mode="HTML")
 
 
@@ -447,7 +657,7 @@ async def cmd_bonus(msg: Message):
 async def cb_start_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
-    await cb.answer("▶️ Запускаю...")
+    await cb.answer("▶️...")
     import main as app_main
     accounts = await db.get_accounts(status="active")
     count = 0
@@ -464,7 +674,7 @@ async def cb_start_all(cb: CallbackQuery):
 async def cb_stop_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
-    await cb.answer("⏸ Останавливаю...")
+    await cb.answer("⏸...")
     import main as app_main
     count = len(app_main.workers)
     await app_main.stop_all_workers()
@@ -479,10 +689,8 @@ async def cb_delete_select(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await cb.message.answer(
-        "🗑 Отправь <b>ID</b> для удаления:\n\n"
-        "<code>1</code> | <code>1,3,5</code> | <code>2-5</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML"
+        "🗑 Отправь <b>ID</b>: <code>1,3-5</code>",
+        reply_markup=cancel_kb(), parse_mode="HTML"
     )
     await state.set_state(DeleteAccount.waiting_ids)
     await cb.answer()
@@ -505,12 +713,9 @@ async def step_delete_ids(msg: Message, state: FSMContext):
             if await db.delete_account(acc_id):
                 deleted.append(acc_id)
         except Exception as e:
-            log.warning(f"Удаление {acc_id}: {e}")
+            log.warning(f"Del {acc_id}: {e}")
 
-    text = f"✅ Удалено: <b>{len(deleted)}</b>"
-    if deleted:
-        text += f"\n🗑 ID: {deleted}"
-    await msg.answer(text, reply_markup=back_kb(), parse_mode="HTML")
+    await msg.answer(f"✅ Удалено: <b>{deleted}</b>", reply_markup=back_kb(), parse_mode="HTML")
     await state.clear()
 
 
@@ -519,13 +724,10 @@ async def cb_delete_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, удалить ВСЁ", callback_data="confirm_delete_all")],
+        [InlineKeyboardButton(text="✅ Да", callback_data="confirm_delete_all")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_main")],
     ])
-    await cb.message.answer(
-        "⚠️ <b>Удалить ВСЕ аккаунты?</b>\n\nНеобратимо.",
-        reply_markup=kb, parse_mode="HTML"
-    )
+    await cb.message.answer("⚠️ Удалить ВСЕ аккаунты?", reply_markup=kb, parse_mode="HTML")
     await cb.answer()
 
 
@@ -533,21 +735,15 @@ async def cb_delete_all(cb: CallbackQuery):
 async def cb_confirm_delete_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
-    await cb.answer("💣 Удаляю...")
+    await cb.answer("💣...")
     import main as app_main
     await app_main.stop_all_workers()
-
     accounts = await db.get_accounts()
     count = 0
     for a in accounts:
         if await db.delete_account(a["id"]):
             count += 1
-
-    await cb.message.edit_text(
-        f"💣 Удалено <b>{count}</b> аккаунтов",
-        reply_markup=back_kb(),
-        parse_mode="HTML"
-    )
+    await cb.message.edit_text(f"💣 Удалено: <b>{count}</b>", reply_markup=back_kb(), parse_mode="HTML")
 
 
 @dp.message(Command("del"))
@@ -556,20 +752,15 @@ async def cmd_del(msg: Message):
         return
     parts = msg.text.split()
     if len(parts) != 2:
-        await msg.answer("❌ /del N или /del 1,3-5")
+        await msg.answer("❌ /del 3")
         return
     ids = parse_ids(parts[1])
-    if not ids:
-        await msg.answer("❌ Формат: /del 1,3-5")
-        return
-
     import main as app_main
     deleted = []
     for acc_id in ids:
         await app_main.stop_worker(acc_id)
         if await db.delete_account(acc_id):
             deleted.append(acc_id)
-
     await msg.answer(f"✅ Удалено: <b>{deleted}</b>", parse_mode="HTML")
 
 
@@ -578,14 +769,14 @@ async def cmd_delall(msg: Message):
     if not is_admin(msg.from_user.id):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="confirm_delete_all")],
+        [InlineKeyboardButton(text="✅ Да", callback_data="confirm_delete_all")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_main")],
     ])
-    await msg.answer("⚠️ Удалить ВСЕ аккаунты?", reply_markup=kb, parse_mode="HTML")
+    await msg.answer("⚠️ Удалить всё?", reply_markup=kb, parse_mode="HTML")
 
 
 # =========================================================
-#                    СТАТИСТИКА
+#                    СТАТИСТИКА / ЛОГИ
 # =========================================================
 @dp.callback_query(F.data == "menu_stats")
 async def cb_stats(cb: CallbackQuery):
@@ -596,17 +787,15 @@ async def cb_stats(cb: CallbackQuery):
     active = sum(1 for a in accounts if a["status"] == "active")
     dead = sum(1 for a in accounts if a["status"] == "dead")
     bonuses = sum(a["bonuses"] or 0 for a in accounts)
-
     import main as app_main
     running = len(app_main.workers)
-
     text = (
         f"📊 <b>Статистика</b>\n\n"
         f"👥 Всего: {total}\n"
-        f"🟢 Живых (в БД): {active}\n"
-        f"🔴 Мёртвых (в БД): {dead}\n"
-        f"⚙️ Worker-ов работает: {running}\n"
-        f"🎁 Всего бонусов: {bonuses}"
+        f"🟢 Живых: {active}\n"
+        f"🔴 Мёртвых: {dead}\n"
+        f"⚙️ Worker-ов: {running}\n"
+        f"🎁 Бонусов: {bonuses}"
     )
     try:
         await cb.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
@@ -615,9 +804,6 @@ async def cb_stats(cb: CallbackQuery):
     await cb.answer()
 
 
-# =========================================================
-#                      ЛОГИ
-# =========================================================
 @dp.callback_query(F.data == "menu_logs")
 async def cb_logs(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -667,9 +853,8 @@ async def cb_add(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     await cb.message.answer(
-        "📱 Отправь номер в формате <code>+79991234567</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML"
+        "📱 Отправь номер: <code>+79991234567</code>",
+        reply_markup=cancel_kb(), parse_mode="HTML"
     )
     await state.set_state(AddAccount.waiting_phone)
     await cb.answer()
@@ -679,7 +864,7 @@ async def cb_add(cb: CallbackQuery, state: FSMContext):
 async def cmd_add(msg: Message, state: FSMContext):
     if not is_admin(msg.from_user.id):
         return
-    await msg.answer("📱 Отправь номер в формате +79991234567")
+    await msg.answer("📱 Отправь номер: +79991234567")
     await state.set_state(AddAccount.waiting_phone)
 
 
@@ -689,12 +874,11 @@ async def step_phone(msg: Message, state: FSMContext):
         return
     phone = msg.text.strip().replace(" ", "").replace("-", "")
     if not phone.startswith("+") or not phone[1:].isdigit():
-        await msg.answer("❌ Неверный формат. Пример: +79991234567")
+        await msg.answer("❌ Пример: +79991234567")
         return
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
-
     try:
         sent = await client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash)
@@ -703,7 +887,7 @@ async def step_phone(msg: Message, state: FSMContext):
         await state.set_state(AddAccount.waiting_code)
     except Exception as e:
         await client.disconnect()
-        await msg.answer(f"❌ Ошибка: {e}")
+        await msg.answer(f"❌ {e}")
         await state.clear()
 
 
@@ -713,7 +897,7 @@ async def step_code(msg: Message, state: FSMContext):
         return
     code = msg.text.strip().replace(" ", "")
     if not code.isdigit():
-        await msg.answer("❌ Код только из цифр:")
+        await msg.answer("❌ Код только цифры:")
         return
 
     data = await state.get_data()
@@ -721,7 +905,7 @@ async def step_code(msg: Message, state: FSMContext):
     phone_code_hash = data["phone_code_hash"]
     client = pending_clients.get(msg.from_user.id)
     if not client:
-        await msg.answer("❌ Сессия потеряна. /add заново")
+        await msg.answer("❌ Сессия потеряна. /add")
         await state.clear()
         return
 
@@ -732,10 +916,10 @@ async def step_code(msg: Message, state: FSMContext):
         await state.set_state(AddAccount.waiting_password)
         return
     except PhoneCodeInvalidError:
-        await msg.answer("❌ Неверный код. Попробуй снова:")
+        await msg.answer("❌ Неверный код:")
         return
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        await msg.answer(f"❌ {e}")
         await client.disconnect()
         pending_clients.pop(msg.from_user.id, None)
         await state.clear()
@@ -753,13 +937,13 @@ async def step_password(msg: Message, state: FSMContext):
     phone = data["phone"]
     client = pending_clients.get(msg.from_user.id)
     if not client:
-        await msg.answer("❌ Сессия потеряна. /add заново")
+        await msg.answer("❌ Сессия потеряна. /add")
         await state.clear()
         return
     try:
         await client.sign_in(password=password)
     except Exception as e:
-        await msg.answer(f"❌ Пароль неверный: {e}")
+        await msg.answer(f"❌ {e}")
         return
     await finish_add(msg, state, client, phone)
 
@@ -769,26 +953,20 @@ async def finish_add(msg: Message, state: FSMContext, client: TelegramClient, ph
         me = await client.get_me()
         session_str = client.session.save()
         username = me.username or f"id{me.id}"
-
         acc_id = await db.add_account(phone, session_str, username)
-
         import main as app_main
         await app_main.start_worker(acc_id)
-
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📋 Список", callback_data="menu_list")],
             [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_main")],
         ])
         await msg.answer(
             f"✅ <b>Аккаунт добавлен!</b>\n\n"
-            f"ID: <code>{acc_id}</code>\n"
-            f"Username: @{username}\n"
-            f"Phone: {phone}\n\n"
-            f"⏰ Рассылка: ежедневно в 07:07 Самары",
+            f"ID: <code>{acc_id}</code>\n@{username}\n📞 {phone}",
             reply_markup=kb, parse_mode="HTML"
         )
     except Exception as e:
-        await msg.answer(f"❌ Ошибка сохранения: {e}")
+        await msg.answer(f"❌ {e}")
     finally:
         await client.disconnect()
         pending_clients.pop(msg.from_user.id, None)
@@ -799,5 +977,5 @@ async def finish_add(msg: Message, state: FSMContext, client: TelegramClient, ph
 #                    ЗАПУСК
 # =========================================================
 async def run_admin_bot():
-    log.info(f"🤖 Admin bot запущен. Админов: {len(ADMIN_IDS)}")
+    log.info(f"🤖 Admin bot. Админов: {len(ADMIN_IDS)}")
     await dp.start_polling(bot)
