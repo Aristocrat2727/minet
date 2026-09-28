@@ -1,4 +1,3 @@
-import os
 import asyncio
 import random
 import logging
@@ -11,11 +10,6 @@ from captcha import solve_captcha
 import db
 
 log = logging.getLogger("worker")
-
-# ===== СКОРОСТЬ ОТВЕТА НА КАПЧУ (из Variables) =====
-# Буфер перед ответом (сек) — как будто человек смотрит и вводит
-CAPTCHA_DELAY_MIN = float(os.environ.get("CAPTCHA_DELAY_MIN", 0.3))
-CAPTCHA_DELAY_MAX = float(os.environ.get("CAPTCHA_DELAY_MAX", 1.0))
 
 
 class Worker:
@@ -34,6 +28,20 @@ class Worker:
 
     async def human_pause(self, a=1.0, b=3.0):
         await asyncio.sleep(random.uniform(a, b))
+
+    async def _owner_subscribed(self) -> bool:
+        """Проверяет — подписан ли владелец аккаунта на канал."""
+        owner_id = self.acc.get("owner_id")
+        if not owner_id:
+            return True  # нет владельца — пропускаем
+        try:
+            from admin_bot import check_subscription, is_admin
+            if is_admin(owner_id):
+                return True
+            return await check_subscription(owner_id)
+        except Exception as e:
+            log.warning(f"[акк {self.id}] check_subscription error: {e}")
+            return True  # если ошибка проверки — не блокируем
 
     async def start(self):
         try:
@@ -66,10 +74,10 @@ class Worker:
         msg = event.message
         try:
             if msg.photo:
-                # ⚡ СКАЧИВАЕМ СРАЗУ — без задержки
-                image_bytes = await msg.download_media(bytes)
+                await self.log("INFO", "📩 Капча получена")
+                await self.human_pause(2.5, 6.5)
 
-                # ⚡ OCR — узкое место, но ускорен в captcha.py
+                image_bytes = await msg.download_media(bytes)
                 code = solve_captcha(image_bytes)
                 await self.log("INFO", f"🔍 Распознан код: {code!r}")
 
@@ -77,12 +85,7 @@ class Worker:
                     await self.log("WARN", "Слишком короткий код — пропуск")
                     return
 
-                # ⚡ МИНИМАЛЬНАЯ ПАУЗА — имитация «ввода руками»
-                delay = random.uniform(CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX)
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-                # ⚡ ОТПРАВЛЯЕМ СРАЗУ
+                await self.human_pause(1.5, 4.0)
                 await event.reply(code)
                 await self.log("INFO", f"📤 Отправлен код: {code}")
 
@@ -95,6 +98,13 @@ class Worker:
     async def send_bonus(self):
         if self.stopped:
             return
+
+        # ===== ПРОВЕРКА ПОДПИСКИ ВЛАДЕЛЬЦА =====
+        if not await self._owner_subscribed():
+            await self.log("WARN", "🚫 Владелец не подписан на канал — пропуск")
+            return
+
+        # ===== ОТПРАВКА БОНУСА =====
         try:
             await self.human_pause(2.0, 8.0)
             await self.client.send_message(self.target_bot, self.bonus_text)
