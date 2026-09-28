@@ -15,7 +15,13 @@ from aiogram.exceptions import TelegramBadRequest
 
 from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    UserNotParticipantError,
+    ChannelPrivateError,
+    UsernameNotOccupiedError,
+)
 
 import db
 
@@ -79,7 +85,7 @@ code_message_id: dict[int, int] = {}
 
 
 # =========================================================
-#              ПРОВЕРКА АКТИВНОСТИ
+#              ПРОВЕРКА АКТИВНОСТИ АККАУНТА
 # =========================================================
 async def check_account_alive(session_str: str) -> bool:
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
@@ -97,7 +103,7 @@ async def check_account_alive(session_str: str) -> bool:
 
 
 # =========================================================
-#              ПОДСЧЁТ
+#              ПОДСЧЁТ АККАУНТОВ
 # =========================================================
 async def count_user_accounts(user_id: int) -> int:
     accounts = await db.get_accounts()
@@ -115,16 +121,22 @@ async def count_total_accounts() -> int:
 
 
 # =========================================================
-#              ПРОВЕРКА ПОДПИСКИ
+#              ПРОВЕРКА ПОДПИСКИ (ВСЕГДА)
 # =========================================================
 async def check_subscription(user_id: int) -> bool:
-    """Проверяет, подписан ли юзер на SUBSCRIBE_CHAT."""
+    """Реально проверяет подписку на SUBSCRIBE_CHAT через Telethon."""
     if not SUBSCRIBE_CHAT:
+        log.warning("SUBSCRIBE_CHAT не задан — пропускаю проверку")
         return True
 
     accounts = await db.get_accounts(status="active")
     if not accounts:
+        log.warning("Нет активных аккаунтов — пропускаю проверку")
         return True
+
+    log.info(f"🔍 Проверка подписки user_id={user_id} на {SUBSCRIBE_CHAT}")
+
+    from telethon.tl.functions.channels import GetParticipantRequest
 
     for acc in accounts:
         client = TelegramClient(StringSession(acc["session_str"]), API_ID, API_HASH)
@@ -135,27 +147,42 @@ async def check_subscription(user_id: int) -> bool:
                 continue
 
             try:
-                from telethon.tl.functions.channels import GetParticipantRequest
                 chat = await client.get_entity(SUBSCRIBE_CHAT)
+            except (UsernameNotOccupiedError, ChannelPrivateError) as e:
+                log.warning(f"  [акк {acc['id']}] Канал не найден/закрыт: {e}")
+                await client.disconnect()
+                continue
+            except Exception as e:
+                log.warning(f"  [акк {acc['id']}] Не могу получить entity: {e}")
+                await client.disconnect()
+                continue
+
+            try:
                 await client(GetParticipantRequest(channel=chat, participant=user_id))
+                log.info(f"  [акк {acc['id']}] ✅ Юзер {user_id} ПОДПИСАН")
                 await client.disconnect()
                 return True
+            except UserNotParticipantError:
+                log.info(f"  [акк {acc['id']}] ❌ Юзер {user_id} НЕ подписан")
+                await client.disconnect()
+                return False
             except Exception as e:
                 err = str(e).lower()
+                log.warning(f"  [акк {acc['id']}] Ошибка проверки: {e}")
                 await client.disconnect()
-                if "not a participant" in err or "user not participant" in err:
+                if "not a participant" in err:
                     return False
-                elif "cannot find" in err or "not found" in err:
-                    continue
-                else:
-                    continue
-        except Exception:
+                continue
+
+        except Exception as e:
+            log.warning(f"  [акк {acc['id']}] Общая ошибка: {e}")
             try:
                 await client.disconnect()
             except Exception:
                 pass
             continue
 
+    log.warning("Не удалось проверить подписку — пропускаю (не блокирую)")
     return True
 
 
@@ -167,25 +194,51 @@ def subscribe_kb() -> InlineKeyboardMarkup:
 
 
 async def require_subscription(obj) -> bool:
+    """
+    Проверяет подписку ВСЕГДА (без кэша).
+    Возвращает True если подписан. Иначе показывает требование.
+    """
     user_id = obj.from_user.id
+
+    # Админам — всегда доступ
     if is_admin(user_id):
         return True
-    if await db.is_subscriber(user_id):
+
+    # Регистрируем юзера
+    try:
+        user = obj.from_user
+        await db.add_subscriber(user_id, user.username or "", user.first_name or "")
+    except Exception:
+        pass
+
+    # ✅ ВСЕГДА проверяем через Telethon
+    sub = await check_subscription(user_id)
+
+    if sub:
+        try:
+            await db.mark_subscribed(user_id, True)
+        except Exception:
+            pass
         return True
 
-    sub = await check_subscription(user_id)
-    if sub:
-        await db.mark_subscribed(user_id, True)
-        return True
+    # Не подписан — обновляем статус и показываем требование
+    try:
+        await db.mark_subscribed(user_id, False)
+    except Exception:
+        pass
 
     text = (
         "📢 <b>Для использования бота нужно подписаться на наш канал</b>\n\n"
+        f"👥 Канал: {SUBSCRIBE_CHAT}\n\n"
         "После подписки нажми кнопку «✅ Я подписался»."
     )
     try:
         await obj.answer(text, reply_markup=subscribe_kb(), parse_mode="HTML")
     except Exception:
-        await obj.message.answer(text, reply_markup=subscribe_kb(), parse_mode="HTML")
+        try:
+            await obj.message.answer(text, reply_markup=subscribe_kb(), parse_mode="HTML")
+        except Exception:
+            pass
     return False
 
 
@@ -450,11 +503,14 @@ async def send_admin_menu(target, edit: bool = False):
 async def cmd_start(msg: Message):
     user_id = msg.from_user.id
 
-    await db.add_subscriber(
-        user_id,
-        msg.from_user.username or "",
-        msg.from_user.first_name or ""
-    )
+    try:
+        await db.add_subscriber(
+            user_id,
+            msg.from_user.username or "",
+            msg.from_user.first_name or ""
+        )
+    except Exception:
+        pass
 
     if is_admin(user_id):
         await send_admin_menu(msg)
@@ -474,7 +530,10 @@ async def cb_check_sub(cb: CallbackQuery):
 
     sub = await check_subscription(user_id)
     if sub:
-        await db.mark_subscribed(user_id, True)
+        try:
+            await db.mark_subscribed(user_id, True)
+        except Exception:
+            pass
         try:
             await cb.message.delete()
         except Exception:
@@ -482,7 +541,7 @@ async def cb_check_sub(cb: CallbackQuery):
         welcome = await build_welcome_text()
         await cb.message.answer(welcome, reply_markup=user_menu_kb(), parse_mode="HTML")
     else:
-        await cb.answer("❌ Ты ещё не подписался", show_alert=True)
+        await cb.answer("❌ Ты ещё не подписался на канал", show_alert=True)
 
 
 @dp.message(Command("help"))
@@ -508,21 +567,21 @@ async def cmd_help(msg: Message):
 
 
 # =========================================================
-#                   ЮЗЕР CALLBACK
+#                   ЮЗЕР CALLBACK (с проверкой)
 # =========================================================
 @dp.callback_query(F.data == "user_menu")
 async def cb_user_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    if not is_admin(cb.from_user.id):
-        if not await db.is_subscriber(cb.from_user.id):
-            if not await require_subscription(cb):
-                return
+    if not await require_subscription(cb):
+        return
     await send_user_menu(cb.message, edit=True, user_id=cb.from_user.id)
     await cb.answer()
 
 
 @dp.callback_query(F.data == "user_help")
 async def cb_user_help(cb: CallbackQuery):
+    if not await require_subscription(cb):
+        return
     await cb.message.edit_text(
         "❓ <b>Помощь</b>\n\n"
         "• <b>Подключить аккаунт</b> — добавь аккаунт.\n"
@@ -647,6 +706,8 @@ async def cb_main(cb: CallbackQuery, state: FSMContext):
     if is_admin(cb.from_user.id):
         await send_admin_menu(cb.message, edit=True)
     else:
+        if not await require_subscription(cb):
+            return
         await send_user_menu(cb.message, edit=True, user_id=cb.from_user.id)
     await cb.answer()
 
@@ -1553,4 +1614,5 @@ async def cmd_kill(msg: Message, state: FSMContext):
 # =========================================================
 async def run_admin_bot():
     log.info(f"🤖 Admin bot. Админов: {len(ADMIN_IDS)}")
+    log.info(f"📢 Обязательная подписка: {SUBSCRIBE_CHAT}")
     await dp.start_polling(bot)
