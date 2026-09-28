@@ -42,6 +42,19 @@ async def start_worker(acc_id: int):
         log.warning(f"Аккаунт {acc_id} dead — пропуск")
         return
 
+    # ===== ПРОВЕРКА ПОДПИСКИ ВЛАДЕЛЬЦА =====
+    owner_id = acc.get("owner_id")
+    if owner_id:
+        try:
+            from admin_bot import check_subscription, is_admin
+            if not is_admin(owner_id):
+                subscribed = await check_subscription(owner_id)
+                if not subscribed:
+                    log.warning(f"🚫 Владелец {owner_id} не подписан — не запускаю аккаунт {acc_id}")
+                    return
+        except Exception as e:
+            log.warning(f"Проверка подписки владельца: {e}")
+
     w = Worker(acc, API_ID, API_HASH, TARGET_BOT, BONUS_TEXT)
     try:
         await w.start()
@@ -66,6 +79,7 @@ async def stop_worker(acc_id: int):
     w = workers.pop(acc_id, None)
     if w:
         await w.stop()
+        log.info(f"Worker {acc_id} остановлен")
     try:
         scheduler.remove_job(f"bonus_{acc_id}")
     except Exception:
