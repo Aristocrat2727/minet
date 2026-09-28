@@ -9,6 +9,7 @@ async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with pool.acquire() as conn:
+        # accounts
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id SERIAL PRIMARY KEY,
@@ -24,6 +25,10 @@ async def init_db():
             );
         """)
         await conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS owner_id BIGINT;")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_owner_id ON accounts(owner_id);")
+
+        # logs
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id SERIAL PRIMARY KEY,
@@ -33,8 +38,26 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_account ON logs(account_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at DESC);")
+
+        # settings
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('fake_accounts_offset', '0')
+            ON CONFLICT (key) DO NOTHING;
+        """)
 
 
+# =========================================================
+#                    ACCOUNTS
+# =========================================================
 async def add_account(phone: str, session_str: str, username: str, owner_id: int | None = None) -> int:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -85,6 +108,9 @@ async def increment_bonus(acc_id: int):
         )
 
 
+# =========================================================
+#                    LOGS
+# =========================================================
 async def add_log(account_id: int, level: str, message: str):
     async with pool.acquire() as conn:
         await conn.execute(
@@ -97,3 +123,32 @@ async def get_recent_logs(limit: int = 30) -> list:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM logs ORDER BY id DESC LIMIT $1", limit)
         return [dict(r) for r in rows]
+
+
+# =========================================================
+#                    SETTINGS
+# =========================================================
+async def get_setting(key: str, default: str = "") -> str:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
+        return row["value"] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+            ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
+        """, key, value)
+
+
+async def get_fake_accounts_offset() -> int:
+    try:
+        val = await get_setting("fake_accounts_offset", "0")
+        return int(val)
+    except Exception:
+        return 0
+
+
+async def set_fake_accounts_offset(value: int):
+    await set_setting("fake_accounts_offset", str(value))
