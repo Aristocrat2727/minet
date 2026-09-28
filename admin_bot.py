@@ -29,6 +29,12 @@ log.info(f"👤 Админов: {len(ADMIN_IDS)} → {ADMIN_IDS}")
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
+# =========================================================
+#              ОБЯЗАТЕЛЬНАЯ ПОДПИСКА
+# =========================================================
+SUBSCRIBE_CHAT = os.environ.get("SUBSCRIBE_CHAT", "@archigramfarm")
+SUBSCRIBE_URL = os.environ.get("SUBSCRIBE_URL", "https://t.me/archigramfarm")
+
 bot = Bot(token=os.environ["ADMIN_BOT_TOKEN"])
 dp = Dispatcher()
 
@@ -91,7 +97,7 @@ async def check_account_alive(session_str: str) -> bool:
 
 
 # =========================================================
-#              ПОДСЧЁТ АККАУНТОВ
+#              ПОДСЧЁТ
 # =========================================================
 async def count_user_accounts(user_id: int) -> int:
     accounts = await db.get_accounts()
@@ -106,6 +112,81 @@ async def count_total_accounts() -> int:
     except Exception:
         offset = 0
     return real + offset
+
+
+# =========================================================
+#              ПРОВЕРКА ПОДПИСКИ
+# =========================================================
+async def check_subscription(user_id: int) -> bool:
+    """Проверяет, подписан ли юзер на SUBSCRIBE_CHAT."""
+    if not SUBSCRIBE_CHAT:
+        return True
+
+    accounts = await db.get_accounts(status="active")
+    if not accounts:
+        return True
+
+    for acc in accounts:
+        client = TelegramClient(StringSession(acc["session_str"]), API_ID, API_HASH)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10)
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                continue
+
+            try:
+                from telethon.tl.functions.channels import GetParticipantRequest
+                chat = await client.get_entity(SUBSCRIBE_CHAT)
+                await client(GetParticipantRequest(channel=chat, participant=user_id))
+                await client.disconnect()
+                return True
+            except Exception as e:
+                err = str(e).lower()
+                await client.disconnect()
+                if "not a participant" in err or "user not participant" in err:
+                    return False
+                elif "cannot find" in err or "not found" in err:
+                    continue
+                else:
+                    continue
+        except Exception:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            continue
+
+    return True
+
+
+def subscribe_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=SUBSCRIBE_URL)],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
+    ])
+
+
+async def require_subscription(obj) -> bool:
+    user_id = obj.from_user.id
+    if is_admin(user_id):
+        return True
+    if await db.is_subscriber(user_id):
+        return True
+
+    sub = await check_subscription(user_id)
+    if sub:
+        await db.mark_subscribed(user_id, True)
+        return True
+
+    text = (
+        "📢 <b>Для использования бота нужно подписаться на наш канал</b>\n\n"
+        "После подписки нажми кнопку «✅ Я подписался»."
+    )
+    try:
+        await obj.answer(text, reply_markup=subscribe_kb(), parse_mode="HTML")
+    except Exception:
+        await obj.message.answer(text, reply_markup=subscribe_kb(), parse_mode="HTML")
+    return False
 
 
 # =========================================================
@@ -182,13 +263,13 @@ async def kill_other_sessions(session_str: str) -> dict:
 #                   ПРИВЕТСТВИЕ
 # =========================================================
 async def build_welcome_text() -> str:
-    total = await count_total_accounts()
+    total_accounts = await count_total_accounts()
     return (
         "👋 <b>Добро пожаловать в Bonus Farm!</b>\n\n"
         "🤖 <b>Что это за бот?</b>\n\n"
         "Это <b>ферма для автоматического получения бонусов</b> "
         "в Telegram-ботах.\n\n"
-        f"👥 <b>В боте уже подключено: {total} аккаунтов</b>\n\n"
+        f"👥 <b>В боте уже подключено: {total_accounts} аккаунтов</b>\n\n"
         "⚙️ <b>Как работает:</b>\n"
         "• Ты подключаешь свой аккаунт (номер + код из Telegram)\n"
         "• Бот раз в сутки сам отправляет команду «🎁Бонус»\n"
@@ -231,7 +312,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Удалить выборочно", callback_data="delete_select"),
             InlineKeyboardButton(text="💣 Удалить всех", callback_data="delete_all"),
         ],
-        [InlineKeyboardButton(text="👁 Визуал (счётчик)", callback_data="menu_visual")],
+        [InlineKeyboardButton(text="👁 Визуал (аккаунты)", callback_data="menu_visual")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton(text="📜 Логи", callback_data="menu_logs")],
     ])
@@ -368,11 +449,40 @@ async def send_admin_menu(target, edit: bool = False):
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     user_id = msg.from_user.id
+
+    await db.add_subscriber(
+        user_id,
+        msg.from_user.username or "",
+        msg.from_user.first_name or ""
+    )
+
     if is_admin(user_id):
         await send_admin_menu(msg)
-    else:
+        return
+
+    if not await require_subscription(msg):
+        return
+
+    welcome = await build_welcome_text()
+    await msg.answer(welcome, reply_markup=user_menu_kb(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    await cb.answer("🔍 Проверяю...", show_alert=False)
+
+    sub = await check_subscription(user_id)
+    if sub:
+        await db.mark_subscribed(user_id, True)
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
         welcome = await build_welcome_text()
-        await msg.answer(welcome, reply_markup=user_menu_kb(), parse_mode="HTML")
+        await cb.message.answer(welcome, reply_markup=user_menu_kb(), parse_mode="HTML")
+    else:
+        await cb.answer("❌ Ты ещё не подписался", show_alert=True)
 
 
 @dp.message(Command("help"))
@@ -403,6 +513,10 @@ async def cmd_help(msg: Message):
 @dp.callback_query(F.data == "user_menu")
 async def cb_user_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
+    if not is_admin(cb.from_user.id):
+        if not await db.is_subscriber(cb.from_user.id):
+            if not await require_subscription(cb):
+                return
     await send_user_menu(cb.message, edit=True, user_id=cb.from_user.id)
     await cb.answer()
 
@@ -422,6 +536,8 @@ async def cb_user_help(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "user_add")
 async def cb_user_add(cb: CallbackQuery, state: FSMContext):
+    if not await require_subscription(cb):
+        return
     await cb.message.answer(
         "📱 <b>Подключение аккаунта</b>\n\n"
         "Отправь номер телефона <b>сообщением</b> в формате:\n"
@@ -435,6 +551,8 @@ async def cb_user_add(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "user_bonus")
 async def cb_user_bonus(cb: CallbackQuery):
+    if not await require_subscription(cb):
+        return
     import main as app_main
     user_id = cb.from_user.id
     accounts = await db.get_accounts()
@@ -445,7 +563,6 @@ async def cb_user_bonus(cb: CallbackQuery):
         return
 
     await cb.answer("⏳ Запускаю...", show_alert=False)
-
     count = 0
     active_count = sum(1 for a in own if a["status"] == "active")
     for a in own:
@@ -474,6 +591,8 @@ async def cb_user_bonus(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "user_my_accounts")
 async def cb_user_my_accounts(cb: CallbackQuery):
+    if not await require_subscription(cb):
+        return
     user_id = cb.from_user.id
     accounts = await db.get_accounts()
     own = accounts if is_admin(user_id) else [a for a in accounts if a.get("owner_id") == user_id]
@@ -492,10 +611,12 @@ async def cb_user_my_accounts(cb: CallbackQuery):
 
     active = sum(1 for a in own if a["status"] == "active")
     dead = sum(1 for a in own if a["status"] == "dead")
+    my_bonuses = sum(a["bonuses"] or 0 for a in own)
 
     lines = [
         f"📋 <b>Мои аккаунты</b>\n",
         f"📱 Твоих: <b>{len(own)}</b> (🟢 {active} / 🔴 {dead})",
+        f"🎁 Твоих бонусов: <b>{my_bonuses}</b>",
         f"👥 Всего в боте: <b>{total_count}</b>\n",
     ]
     for a in own:
@@ -531,7 +652,7 @@ async def cb_main(cb: CallbackQuery, state: FSMContext):
 
 
 # =========================================================
-#              ВИЗУАЛ
+#              ВИЗУАЛ АККАУНТОВ
 # =========================================================
 @dp.callback_query(F.data == "menu_visual")
 async def cb_menu_visual(cb: CallbackQuery, state: FSMContext):
@@ -545,14 +666,11 @@ async def cb_menu_visual(cb: CallbackQuery, state: FSMContext):
     total = real + offset
 
     text = (
-        f"👁 <b>Настройка визуала</b>\n\n"
+        f"👁 <b>Настройка визуала аккаунтов</b>\n\n"
         f"📊 Реальных аккаунтов: {real}\n"
         f"🎭 Искусственный offset: {offset}\n"
         f"👥 Юзеры видят: {total}\n\n"
-        f"<b>Что это?</b>\n"
-        f"Юзер видит число «Всего в боте: {total}».\n"
-        f"= реальных ({real}) + offset ({offset}).\n\n"
-        f"Нажми «Изменить число», чтобы задать offset."
+        f"Отправь новое число offset, чтобы изменить."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить число", callback_data="visual_set")],
@@ -569,7 +687,6 @@ async def cb_menu_visual(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "visual_set")
 async def cb_visual_set(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
         return
     offset = await db.get_fake_accounts_offset()
     accounts = await db.get_accounts()
@@ -589,7 +706,6 @@ async def cb_visual_set(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "visual_reset")
 async def cb_visual_reset(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
         return
     await db.set_fake_accounts_offset(0)
     await cb.answer("✅ Сброшено на 0", show_alert=True)
@@ -954,7 +1070,7 @@ async def cb_stats(cb: CallbackQuery):
         f"⚙️ Worker-ов: <b>{running}</b>\n"
         f"👤 Владельцев: <b>{len(owners)}</b>\n"
         f"🎁 Всего бонусов: <b>{bonuses}</b>\n\n"
-        f"👁 Юзеры видят: <b>{total + offset}</b>"
+        f"👁 Юзеры видят аккаунтов: <b>{total + offset}</b>"
     )
     try:
         await cb.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
