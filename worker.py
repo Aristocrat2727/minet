@@ -4,20 +4,22 @@ import logging
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import AuthKeyUnregisteredError, FloodWaitError, SessionRevokedError
+from telethon.tl.types import User
+from telethon.errors import AuthKeyUnregisteredError, FloodWaitError
 
 from captcha import solve_captcha
 import db
 
 log = logging.getLogger("worker")
 
-# Максимум капч за один цикл
-MAX_CAPTCHA_ATTEMPTS = 5
+# Сколько раз пробуем ОДНУ капчу, прежде чем жать "Новый код"
+ATTEMPTS_PER_CAPTCHA = 2
+# Максимум капч за цикл
+MAX_CAPTCHAS = 3
 
 
 class Worker:
-    def __init__(self, acc: dict, api_id: int, api_hash: str,
-                 target_bot: str, bonus_text: str):
+    def __init__(self, acc, api_id, api_hash, target_bot, bonus_text):
         self.acc = acc
         self.id = acc["id"]
         self.target_bot = target_bot
@@ -25,19 +27,22 @@ class Worker:
         self.client = TelegramClient(StringSession(acc["session_str"]), api_id, api_hash)
         self.stopped = False
 
-        # Состояние
-        self._last_msg_id = None         # ID последнего обработанного сообщения
-        self._captcha_attempts = 0        # сколько капч за цикл
-        self._awaiting_new_captcha = False  # ждём ли новую капчу после нажатия "Новый код"
+        # Состояние цикла
+        self._current_image_bytes = None   # байты текущей капчи
+        self._current_code = None          # текущий распознанный код
+        self._attempts_on_current = 0      # сколько раз пытались на текущей
+        self._captchas_used = 0            # сколько капч использовали за цикл
+        self._awaiting_new = False         # ждём ли новую капчу после нажатия "Новый код"
+        self._last_id = None
 
-    async def log(self, level: str, msg: str):
+    async def log(self, level, msg):
         log.info(f"[акк {self.id}] {msg}")
         await db.add_log(self.id, level, msg)
 
-    async def human_pause(self, a=1.0, b=3.0):
+    async def pause(self, a=1.0, b=3.0):
         await asyncio.sleep(random.uniform(a, b))
 
-    async def _owner_subscribed(self) -> bool:
+    async def _owner_subscribed(self):
         owner_id = self.acc.get("owner_id")
         if not owner_id:
             return True
@@ -46,29 +51,34 @@ class Worker:
             if is_admin(owner_id):
                 return True
             return await check_subscription(owner_id)
-        except Exception as e:
-            log.warning(f"[акк {self.id}] check_subscription error: {e}")
+        except Exception:
             return True
 
     async def start(self):
-        try:
-            await self.client.connect()
-            if not await self.client.is_user_authorized():
-                await self.log("ERROR", "🚫 Сессия не авторизована — пересоздай")
-                await db.update_status(self.id, "dead", "session not authorized")
-                await self.client.disconnect()
-                raise Exception("Session not authorized")
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            await self.log("ERROR", "Сессия не авторизована")
+            await db.update_status(self.id, "dead", "not authorized")
+            await self.client.disconnect()
+            raise Exception("not authorized")
 
-            me = await self.client.get_me()
-            await self.log("INFO", f"✅ Запущен как @{me.username or me.id}")
+        me = await self.client.get_me()
+        await self.log("INFO", f"✅ Запущен @{me.username or me.id}")
 
-            self.client.add_event_handler(
-                self.on_message, events.NewMessage(from_users=self.target_bot)
-            )
-        except (AuthKeyUnregisteredError, SessionRevokedError):
-            await self.log("ERROR", "🚫 Сессия отозвана — пересоздай")
-            await db.update_status(self.id, "dead", "session revoked")
-            raise
+        # Фильтр: только ЛС от целевого бота
+        target_username = self.target_bot.lstrip("@").lower()
+
+        async def filt(event):
+            if not event.is_private:
+                return False
+            sender = await event.get_sender()
+            if not isinstance(sender, User) or not sender.bot:
+                return False
+            if (sender.username or "").lower() != target_username:
+                return False
+            return True
+
+        self.client.add_event_handler(self.on_msg, events.NewMessage(func=filt))
 
     async def stop(self):
         self.stopped = True
@@ -77,137 +87,158 @@ class Worker:
         except Exception:
             pass
 
-    async def _press_new_code_button(self, msg):
-        """Нажимает кнопку '🔄 Новый код' в сообщении."""
+    async def press_new_code(self, msg):
+        """Нажимает кнопку 'Новый код'."""
         if not msg.buttons:
             return False
         for row in msg.buttons:
             for btn in row:
-                btn_text = btn.text.lower()
-                # Ищем кнопку "Новый код" / "New code" / "Обновить"
-                if any(k in btn_text for k in ["новый код", "новый", "new code", "refresh", "обновить"]):
-                    if btn.url:
-                        continue
+                if btn.url:
+                    continue
+                t = btn.text.lower()
+                if any(k in t for k in ["новый код", "новый", "new", "refresh", "обновить"]):
                     try:
                         await btn.click()
-                        await self.log("INFO", f"👆 Нажал '{btn.text}' — жду новую капчу")
+                        await self.log("INFO", f"👆 Нажал '{btn.text}'")
                         return True
                     except Exception as e:
-                        await self.log("WARN", f"Не смог нажать '{btn.text}': {e}")
+                        await self.log("WARN", f"click err: {e}")
         return False
 
-    async def on_message(self, event):
-        msg = event.message
+    async def solve_and_send(self, event, image_bytes):
+        """Распознаёт и отправляет капчу. Не сбрасывает состояние."""
+        self._current_image_bytes = image_bytes
+        await self.pause(2.0, 4.0)
+        code = solve_captcha(image_bytes)
+        self._current_code = code
+        self._attempts_on_current += 1
 
-        # Не обрабатываем дубликаты одного и того же сообщения
-        if msg.id == self._last_msg_id:
+        await self.log(
+            "INFO",
+            f"📩 Капча #{self._captchas_used} | "
+            f"попытка {self._attempts_on_current}/{ATTEMPTS_PER_CAPTCHA} | "
+            f"код: {code!r}"
+        )
+
+        if not code or len(code) < 3:
+            await self.log("WARN", "Короткий код")
+            # Сразу жмём "Новый код"
+            return False
+
+        await self.pause(1.5, 4.0)
+        await event.reply(code)
+        await self.log("INFO", f"📤 Отправлен: {code}")
+        return True
+
+    async def on_msg(self, event):
+        if not event.is_private:
             return
-        self._last_msg_id = msg.id
+
+        msg = event.message
+        if msg.id == self._last_id:
+            return
+        self._last_id = msg.id
 
         try:
             # ===== ФОТО = КАПЧА =====
             if msg.photo:
-                # Если это первая капча — обнуляем попытки
-                if not self._awaiting_new_captcha:
-                    self._captcha_attempts = 0
+                # Если это НЕ после нажатия "Новый код" — значит, первая капча цикла
+                if not self._awaiting_new and self._captchas_used == 0:
+                    self._captchas_used = 1
+                    self._attempts_on_current = 0
+                elif self._awaiting_new:
+                    # Это новая капча после нажатия "Новый код"
+                    self._captchas_used += 1
+                    self._attempts_on_current = 0
+                    self._awaiting_new = False
 
-                self._captcha_attempts += 1
-                self._awaiting_new_captcha = False  # получили новую — сбрасываем флаг
-
-                await self.log("INFO", f"📩 Капча получена (попытка {self._captcha_attempts}/{MAX_CAPTCHA_ATTEMPTS})")
-
-                # Проверка на лимит
-                if self._captcha_attempts > MAX_CAPTCHA_ATTEMPTS:
-                    await self.log("WARN", f"🚫 Лимит {MAX_CAPTCHA_ATTEMPTS} капч за цикл — стоп")
+                if self._captchas_used > MAX_CAPTCHAS:
+                    await self.log("WARN", f"🚫 Лимит {MAX_CAPTCHAS} капч — стоп")
                     return
 
-                # Скачиваем и распознаём
                 image_bytes = await msg.download_media(bytes)
-                await self.human_pause(2.0, 4.5)
-
-                code = solve_captcha(image_bytes)
-                await self.log("INFO", f"🔍 Распознан код: {code!r}")
-
-                if not code or len(code) < 3:
-                    await self.log("WARN", "Слишком короткий код — жму 'Новый код'")
-                    # Пробуем получить новую капчу
-                    if await self._press_new_code_button(msg):
-                        self._awaiting_new_captcha = True
-                    return
-
-                # Отправляем код
-                await self.human_pause(1.5, 4.0)
-                await event.reply(code)
-                await self.log("INFO", f"📤 Отправлен код: {code}")
+                await self.solve_and_send(event, image_bytes)
 
             # ===== ТЕКСТ =====
             elif msg.text:
-                text = msg.text
-                await self.log("INFO", f"💬 Бот: {text[:120]}")
-                text_lower = text.lower()
+                t = msg.text.lower()
+                await self.log("INFO", f"💬 Бот: {msg.text[:100]}")
 
-                # ===== УСПЕХ =====
-                if any(k in text_lower for k in ["начислен", "получен", "успешн", "зачислен"]):
+                # УСПЕХ
+                if any(k in t for k in ["начислен", "получен", "успешн", "зачислен"]):
                     await self.log("INFO", "✅ БОНУС ПОЛУЧЕН")
-                    self._captcha_attempts = 0
-                    self._awaiting_new_captcha = False
+                    self._reset_cycle()
                     try:
                         await db.increment_bonus(self.id)
                     except Exception:
                         pass
                     return
 
-                # ===== НЕВЕРНЫЙ КОД =====
-                if any(k in text_lower for k in ["неверн", "попробуй", "ошибк"]):
-                    await self.log("WARN", f"❌ Неверный код (попытка {self._captcha_attempts}/{MAX_CAPTCHA_ATTEMPTS})")
+                # НЕВЕРНЫЙ КОД
+                if any(k in t for k in ["неверн", "попробуй", "ошибк"]):
+                    await self.log(
+                        "WARN",
+                        f"❌ Неверно | "
+                        f"капча #{self._captchas_used} | "
+                        f"попытка {self._attempts_on_current}/{ATTEMPTS_PER_CAPTCHA}"
+                    )
 
-                    # Проверяем лимит
-                    if self._captcha_attempts >= MAX_CAPTCHA_ATTEMPTS:
-                        await self.log("WARN", f"🚫 Лимит {MAX_CAPTCHA_ATTEMPTS} попыток — стоп на этот цикл")
+                    # ===== ГЛАВНАЯ ЛОГИКА =====
+                    if self._attempts_on_current < ATTEMPTS_PER_CAPTCHA:
+                        # Ещё не пробовали повторно — решаем ТУ ЖЕ капчу заново
+                        await self.log("INFO", f"🔁 Повторное решение той же капчи")
+                        await self.pause(1.5, 3.0)
+                        if self._current_image_bytes:
+                            await self.solve_and_send(event, self._current_image_bytes)
                         return
 
-                    # Ждём немного и жмём "Новый код"
-                    await self.human_pause(2.0, 4.0)
+                    # Уже 2 раза неверно — жмём "Новый код"
+                    if self._captchas_used >= MAX_CAPTCHAS:
+                        await self.log("WARN", f"🚫 Лимит {MAX_CAPTCHAS} капч — стоп")
+                        self._reset_cycle()
+                        return
 
-                    pressed = await self._press_new_code_button(msg)
+                    await self.log("INFO", "🔄 2 попытки неверно — жму 'Новый код'")
+                    await self.pause(2.0, 4.0)
+
+                    pressed = await self.press_new_code(msg)
                     if pressed:
-                        self._awaiting_new_captcha = True
+                        self._awaiting_new = True
                     else:
-                        await self.log("WARN", "Кнопка 'Новый код' не найдена — стоп")
-                        return
-
-                # ===== КНОПКИ В ТЕКСТОВОМ СООБЩЕНИИ =====
-                # (иногда кнопка идёт вместе с текстом)
-                if msg.buttons and not self._awaiting_new_captcha:
-                    # Если это не сообщение о неверном коде, но есть кнопка "Новый код" — жмём
-                    pass
+                        await self.log("WARN", "Кнопка 'Новый код' не найдена")
+                        self._reset_cycle()
 
         except Exception as e:
-            await self.log("ERROR", f"Ошибка обработки: {e}")
+            await self.log("ERROR", f"{e}")
+
+    def _reset_cycle(self):
+        self._current_image_bytes = None
+        self._current_code = None
+        self._attempts_on_current = 0
+        self._captchas_used = 0
+        self._awaiting_new = False
 
     async def send_bonus(self):
         if self.stopped:
             return
 
         if not await self._owner_subscribed():
-            await self.log("WARN", "🚫 Владелец не подписан — пропуск")
+            await self.log("WARN", "🚫 Владелец не подписан")
             return
 
-        # Обнуляем счётчики для нового цикла
-        self._captcha_attempts = 0
-        self._awaiting_new_captcha = False
-        self._last_msg_id = None
+        self._reset_cycle()
+        self._last_id = None
 
         try:
-            await self.human_pause(2.0, 8.0)
+            await self.pause(2.0, 8.0)
             await self.client.send_message(self.target_bot, self.bonus_text)
             await self.log("INFO", f"📨 Отправлено '{self.bonus_text}'")
         except FloodWaitError as e:
-            await self.log("WARN", f"FloodWait {e.seconds}с")
+            await self.log("WARN", f"FloodWait {e.seconds}")
             await asyncio.sleep(e.seconds)
-        except (AuthKeyUnregisteredError, SessionRevokedError):
-            await self.log("ERROR", "🚫 Сессия отозвана")
-            await db.update_status(self.id, "dead", "session revoked")
+        except AuthKeyUnregisteredError:
+            await self.log("ERROR", "Сессия отозвана")
+            await db.update_status(self.id, "dead", "revoked")
             self.stopped = True
         except Exception as e:
-            await self.log("ERROR", f"Ошибка отправки: {e}")
+            await self.log("ERROR", f"{e}")
